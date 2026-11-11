@@ -186,8 +186,10 @@ window.__ModuleLoader__.load({
       const t = useCallback((key) => (DICT[lang] && DICT[lang][key]) || DICT.zh[key] || key, [lang]);
 
       useEffect(() => {
-        if (!ctx || !ctx.locale || !ctx.locale.subscribe) return;
-        return ctx.locale.subscribe(() => setLang(pickLocale(ctx)));
+        try {
+          if (!ctx || !ctx.locale || !ctx.locale.subscribe) return undefined;
+          return ctx.locale.subscribe(() => setLang(pickLocale(ctx)));
+        } catch { return undefined; }
       }, [ctx]);
 
       useEffect(() => {
@@ -289,8 +291,22 @@ window.__ModuleLoader__.load({
       );
     }
 
+    // Error boundary: a render failure must show the message in-panel, not blank the page.
+    class Boundary extends React.Component {
+      constructor(props) { super(props); this.state = { error: null }; }
+      static getDerivedStateFromError(error) { return { error }; }
+      render() {
+        if (this.state.error) {
+          return h('div', { style: { padding: 24, color: '#fca5a5' } },
+            '面板渲染失败：', String((this.state.error && this.state.error.message) || this.state.error),
+            h('pre', { style: { whiteSpace: 'pre-wrap', opacity: 0.7, fontSize: 12 } }, String((this.state.error && this.state.error.stack) || '')));
+        }
+        return this.props.children;
+      }
+    }
+
     return {
-      inject: ['slots'],
+      inject: ['slots', 'locale'],
       apply(ctx) {
         if (ctx.slots && ctx.slots.inject) {
           ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
@@ -299,7 +315,7 @@ window.__ModuleLoader__.load({
           }, PanelIcon));
           ctx.slots.inject('main', () => ctx.slots.register({
             name: 'main', key: PANEL_ID, order: 30,
-          }, (props) => h(React.Fragment, null, h('style', null, CSS), h(Page, { ctx }))));
+          }, () => h(React.Fragment, null, h('style', null, CSS), h(Boundary, null, h(Page, { ctx })))));
         }
       },
     };
