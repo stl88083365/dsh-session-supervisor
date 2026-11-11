@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session supervisor",
+    "description": "Pairs an executor session with a supervisor session: the supervisor reviews every turn, judges completion, and dispatches bug-fix instructions automatically."
+  }
+}

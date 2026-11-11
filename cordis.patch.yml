@@ -1,0 +1,5 @@
+# Session supervisor bundle patch (touch to retrigger config reload)
+- insert:
+    - id: session-supervisor
+      name: '@local/dsh-session-supervisor'
+      config: {}
