@@ -325,10 +325,13 @@ export function apply(ctx, rawConfig = {}) {
     '客户原始需求：\n' + pair.requirement,
     '评审协议：',
     '1. 收到 [监督评审] 消息时，结合内嵌的执行日志摘录判断完成情况；需要更多上下文用 supervision_worker_log。',
-    '2. 每轮评审必须调用一次 supervision_verdict 收尾，这是你的唯一结论渠道：',
+    '2. 评审对象必须是【交付物本身与运行时证据】，不是执行会话的自述：验收清单逐项由你亲自复现（读文件、跑命令、请求 API、查注册）；凡日志里说成功而你无法复核、或复核不过的，一律 needs_fix。',
+    '3. 评审材料里的【硬故障证据】（浏览器上报错误/客户直接反馈）是无条件 bug：只要存在未解决记录，禁止 complete。',
+    '4. 每轮评审必须调用一次 supervision_verdict 收尾，这是你的唯一结论渠道：',
     '   - complete：需求全部满足且有验证证据；summary 写验收依据。',
     '   - needs_fix：存在 bug/未完成/验证缺失；summary 写症状，fixInstructions 写给执行会话的具体修复指令。',
-    `3. 客户中途补充要求属正常输入，不算 bug；自动修复上限 ${config.maxFixRounds} 轮，评审总预算 ${config.maxReviews} 轮，超限插件自动熔断。`,
+    `5. 客户中途补充要求（[新客户要求] 标注）属正常输入，并入验收范围；除此以外执行会话的自查轮询不算 bug。`,
+    `6. 验收清单与浏览器/客户上报错误的来源：客户随时可经 UI 面板「反馈给客户/评审」或监督对补充要求，插件自动注入评审——你不需要等执行会话转述。`,
     '4. 允许的调用只有：supervision_verdict、supervision_worker_log、supervision_status。禁止 supervision_start / supervision_enroll / supervision_done（那是执行会话的上报渠道）。',
   ].join('\n')
 
@@ -457,12 +460,26 @@ export function apply(ctx, rawConfig = {}) {
     const supervisorTokens = contextTokens(pair.supervisorId)
     pair.lastWorkerTokens = workerTokens
     pair.lastSupervisorTokens = supervisorTokens
+    // 未决浏览器错误（UI 崩溃这类日志外的故障由 client 上报回评审回路）
+    let errorScanAt = pair.lastErrorScanAt
+    const uiErrors = journal.events
+      .filter((event) => (event.kind === 'client-error' || event.kind === 'user-review') && event.at > errorScanAt && (!event.pairId || event.pairId === pair.id))
+      .slice(-6)
+    pair.lastErrorScanAt = Date.now()
+    const uiErrorNote = uiErrors.length
+      ? `【硬故障证据·必须处理】未解决的上报错误（浏览器/客户直接反馈，属于必须评审的 bug，逐条在 verdict summary 回应）：\n${uiErrors.map((event) => `- [${new Date(event.at).toLocaleString()}] ${snippet(event.kind === 'user-review' ? event.data?.text : `${event.data?.message} @ ${event.data?.pageUrl || ''}\n${event.data?.stack || ''}`, 500)}`).join('\n')}`
+      : ''
+    const acceptanceNote = pair.requirements.length > 1 || pair.currentRequirement.includes('【验收清单】')
+      ? `验收标准（逐项实际复现核验：文件真实存在/命令输出一致/API 返回正常/页面可打开，跳过任何一项都判 needs_fix）：\n${pair.currentRequirement}`
+      : ''
     const text = [
       `[监督评审 #${pair.reviews}] 监督对 ${pair.id}「${pair.name}」`,
       `触发：${trigger || '人工触发评审'}`,
       `执行会话当前：${pair.workerRunning ? '运行中' : '空闲'}；累计自动修复 ${pair.fixRounds}/${config.maxFixRounds} 轮；评审预算 ${pair.reviews}/${config.maxReviews}。`,
       `上下文互审：执行侧 ≈${kTokens(workerTokens)}，监督侧 ≈${kTokens(supervisorTokens)}（上限 ${kTokens(config.maxContextTokens)}，达线自动接力）。${pair.handovers > 0 ? `已接力 ${pair.handovers} 次。` : ''}`,
       handoverNote,
+      acceptanceNote,
+      uiErrorNote,
       errorNote,
       '--- 执行日志摘录（自上次评审）---',
       digest.text || '（无新增记录）',
@@ -584,13 +601,20 @@ export function apply(ctx, rawConfig = {}) {
     }
   }
 
-  async function startPair({ name, requirement, cwd, workerSessionId }) {
+  async function startPair({ name, requirement, acceptance, cwd, workerSessionId }) {
     const workerId = workerSessionId ?? await createSession(cwd)
     const supervisorId = await createSession(cwd)
+    const acceptanceList = Array.isArray(acceptance) ? acceptance.filter((line) => typeof line === 'string' && line.trim()) : []
     const pair = {
       id: `sup-${(pairSeq += 1)}-${Date.now().toString(36).slice(-5)}`,
       name: snippet(name || requirement, 40),
       requirement,
+      currentRequirement: acceptanceList.length
+        ? `${requirement}\n\n【验收清单】\n${acceptanceList.map((line) => `- ${line}`).join('\n')}`
+        : requirement,
+      requirements: [{ at: Date.now(), source: 'start', text: acceptanceList.length ? `${requirement}\n验收清单: ${acceptanceList.join(' | ')}` : requirement }],
+      reviewers: [supervisorId],
+      lastErrorScanAt: Date.now(),
       cwd: cwd ?? null,
       workerId,
       supervisorId,
@@ -624,7 +648,7 @@ export function apply(ctx, rawConfig = {}) {
     pairs.set(pair.id, pair)
     byWorker.set(pair.workerId, pair)
     bySupervisor.set(pair.supervisorId, pair)
-    recordReport('pair', pair, { cwd: pair.cwd, workerId, supervisorId, requirement: snippet(requirement, 2000) })
+    recordReport('pair', pair, { cwd: pair.cwd, workerId, supervisorId, requirement: snippet(requirement, 2000), acceptance: acceptanceList })
     setTitle(workerId, `执行｜${pair.name}`)
     setTitle(supervisorId, `监督｜${pair.name}`)
     serialDeliver(pair, 'card', supervisorId, supervisorCard(pair)).catch((error) => warn('supervisor card delivery failed', error))
@@ -686,6 +710,7 @@ export function apply(ctx, rawConfig = {}) {
       type: 'object',
       properties: {
         requirement: { type: 'string', description: 'The full customer requirement text handed to the executor session.' },
+        acceptance: { type: 'array', items: { type: 'string' }, description: 'Checkable acceptance items the supervisor must independently reproduce (files exist, command output matches, API returns 200, page opens…). Strongly recommended: without them the review only sees the executor self-report.' },
         name: { type: 'string', description: 'Short human-readable task label for both sessions.' },
         cwd: { type: 'string', description: 'Workspace directory for both sessions; defaults to the caller working directory.' },
       },
@@ -695,7 +720,7 @@ export function apply(ctx, rawConfig = {}) {
     async execute(args, exec) {
       assertNotInAnyPair(exec.agent)
       const cwd = args.cwd ?? ctx.get('workingDirectory')?.get?.(exec.agent?.session) ?? undefined
-      const pair = await startPair({ name: args.name, requirement: args.requirement, cwd })
+      const pair = await startPair({ name: args.name, requirement: args.requirement, acceptance: args.acceptance, cwd })
       return {
         text: [
           `监督对已创建：${pair.id}`,
@@ -898,6 +923,52 @@ export function apply(ctx, rawConfig = {}) {
     },
   })
 
+  ctx.tools.register({
+    name: 'supervision_requirement',
+    description: 'Add/inspect acceptance criteria for a pair. Acceptance is the checklist the supervisor must independently reproduce at review time; it is injected verbatim into every later review. Only the customer (or the human driving this conversation) supplies it — this is what stops "self-reported success" from passing review.',
+    parameters: {
+      type: 'object',
+      properties: {
+        pairId: { type: 'string', description: 'Supervision pair id; omit when only one pair exists.' },
+        acceptance: { type: 'array', items: { type: 'string' }, description: 'One line per checkable acceptance item, e.g. "GET /api/x returns 200 with non-empty JSON", "UI panel opens without console error". Must be observable, not aspirational.' },
+        note: { type: 'string', description: 'Optional extra customer context appended to the requirement.' },
+      },
+    },
+    output: textOutput,
+    async execute(args, exec) {
+      const pair = resolvePair(args.pairId, exec.agent)
+      const items = Array.isArray(args.acceptance) ? args.acceptance.filter((line) => typeof line === 'string' && line.trim()) : []
+      if (items.length === 0 && !args.note) return { text: `当前验收标准：\n${pair.currentRequirement}` }
+      pair.requirements.push({ at: Date.now(), source: exec.agent?.id === pair.workerId ? 'worker' : 'human', acceptance: items, note: args.note ?? '' })
+      if (items.length) pair.currentRequirement = `${pair.requirement}\n\n【验收清单】\n${items.map((line) => `- ${line}`).join('\n')}`
+      if (args.note) pair.currentRequirement += `\n\n【客户补充】${args.note}`
+      recordReport('requirement', pair, { acceptance: items, note: args.note ?? '', by: exec.agent?.id === pair.workerId ? 'worker' : 'human' })
+      // Tell the executor too, so it aims at the checklist instead of its own guess.
+      serialDeliver(pair, 'requirement', pair.workerId, `【客户更新验收标准】以下清单是监督评审核验的唯一标准，逐项做到并自证：\n${items.map((line) => `- ${line}`).join('\n')}${args.note ? `\n补充：${args.note}` : ''}`).catch(() => {})
+      return { text: `验收标准已登记（下次评审起注入监督）。当前：\n${pair.currentRequirement}` }
+    },
+  })
+
+  ctx.tools.register({
+    name: 'supervision_feedback',
+    description: 'Push an observed problem straight into the supervision loop: it lands in the durable journal as hard evidence and the next review treats it as an unconditional bug. Use it when the user reports something broken (blank UI, wrong output, crash) even if the executor session claims success.',
+    parameters: {
+      type: 'object',
+      properties: {
+        pairId: { type: 'string', description: 'Supervision pair id; omit when only one pair exists.' },
+        problem: { type: 'string', description: 'What is broken, how to see it, and where (error text, screenshot path, URL).' },
+      },
+      required: ['problem'],
+    },
+    output: textOutput,
+    async execute(args, exec) {
+      const pair = resolvePair(args.pairId, exec.agent)
+      recordReport('user-review', pair, { text: snippet(args.problem, 3000), by: exec.agent?.id ?? 'human' })
+      scheduleReview(pair, { detail: `客户直接反馈问题（硬证据）：${snippet(args.problem, 240)}` }, 800)
+      return { text: `已作为硬故障证据送入监督对 ${pair.id} 的评审回路${pair.busy ? '（当前评审进行中，下一轮必然包含）' : '，串行送审。'}` }
+    },
+  })
+
   // ---------------------------------------------------------------- report query
 
   function reportPayload(query = {}) {
@@ -956,19 +1027,55 @@ export function apply(ctx, rawConfig = {}) {
     },
   })
 
-  // HTTP read API for the UI panel (same-origin only, like other plugin APIs).
+  // HTTP API for the UI panel: GET = report/pair query, POST = browser-side
+  // error uploads and customer feedback straight into the review loop.
   ctx.inject(['webServer'], (webCtx) => {
     let origin = ''
     try { origin = webCtx.webServer.getOrigin() } catch {}
+    const readBody = (req) => new Promise((resolve) => {
+      let raw = ''
+      req.setEncoding('utf8')
+      req.on('data', (chunk) => { raw += chunk; if (raw.length > 65536) { req.destroy(); resolve(null) } })
+      req.on('end', () => { try { resolve(JSON.parse(raw || '{}')) } catch { resolve(null) } })
+      req.on('error', () => resolve(null))
+    })
     return webCtx.webServer.register({
       kind: 'exact',
       path: '/api/session-supervisor',
-      handler(req, res) {
+      async handler(req, res) {
         try {
           const requestOrigin = req.headers.origin
           if (requestOrigin && origin && requestOrigin !== origin) {
             res.writeHead(403, { 'content-type': 'application/json' })
             res.end('{"error":"cross-origin"}')
+            return
+          }
+          if (req.method === 'POST') {
+            const body = await readBody(req)
+            if (!body) { res.writeHead(400, { 'content-type': 'application/json' }); res.end('{"error":"bad-json"}'); return }
+            if (body.type === 'ui-error') {
+              const pair = body.pairId ? pairs.get(body.pairId) : [...pairs.values()].find((candidate) => candidate.state === 'active') ?? null
+              const event = recordReport('client-error', pair, { message: snippet(body.message, 800), stack: snippet(body.stack, 3000), pageUrl: snippet(body.pageUrl, 300), source: 'browser' })
+              if (pair && pair.state === 'active') scheduleReview(pair, { detail: `浏览器错误自动上报（#${event.id}）：${snippet(body.message, 200)}` }, 800)
+              res.writeHead(200, { 'content-type': 'application/json' })
+              res.end(`{"ok":true,"id":${event.id}}`)
+              return
+            }
+            if (body.type === 'ui-review' && typeof body.text === 'string' && body.text.trim()) {
+              const pair = body.pairId ? pairs.get(body.pairId) : [...pairs.values()].filter((candidate) => candidate.state === 'active').sort((a, b) => b.createdAt - a.createdAt)[0] ?? null
+              if (pair) {
+                recordReport('user-review', pair, { text: snippet(body.text, 3000), by: 'ui' })
+                scheduleReview(pair, { detail: `UI 面板客户反馈（硬证据）：${snippet(body.text, 200)}` }, 800)
+                res.writeHead(200, { 'content-type': 'application/json' })
+                res.end('{"ok":true}')
+              } else {
+                res.writeHead(404, { 'content-type': 'application/json' })
+                res.end('{"error":"no-active-pair"}')
+              }
+              return
+            }
+            res.writeHead(400, { 'content-type': 'application/json' })
+            res.end('{"error":"unknown-type"}')
             return
           }
           if (req.method !== 'GET') {

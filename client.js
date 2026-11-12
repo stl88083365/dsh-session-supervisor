@@ -32,6 +32,9 @@ window.__ModuleLoader__.load({
         'filter.complete': '通过',
         'filter.halted': '熔断',
         'filter.handover': '接力',
+      'filter.client-error': '浏览器错误',
+      'filter.user-review': '客户反馈',
+      'filter.requirement': '验收标准',
         'detail.title': '详情',
         'detail.empty': '点击左边的报告条目查看全文。',
         'worker': '执行',
@@ -53,6 +56,12 @@ window.__ModuleLoader__.load({
         'sid': '会话',
         'loading': '读取中…',
         'error': '读取失败：',
+        'feedback.placeholder': '把问题反馈给评审（作为硬证据，下一轮评审必须处理）…',
+        'feedback.send': '反馈给评审',
+        'feedback.ok': '已送入监督评审回路',
+        'feedback.fail': '反馈失败：',
+        'diag.title': '浏览器错误上报（最近）',
+        'diag.empty': '暂无浏览器错误上报记录',
       },
       en: {
         'nav.label': 'Supervision',
@@ -71,6 +80,9 @@ window.__ModuleLoader__.load({
         'filter.complete': 'Done',
         'filter.halted': 'Halt',
         'filter.handover': 'Relay',
+      'filter.client-error': 'UI errors',
+      'filter.user-review': 'Feedback',
+      'filter.requirement': 'Acceptance',
         'detail.title': 'Detail',
         'detail.empty': 'Pick a report to read it.',
         'worker': 'Executor',
@@ -92,6 +104,12 @@ window.__ModuleLoader__.load({
         'sid': 'Session',
         'loading': 'Loading…',
         'error': 'Load failed: ',
+        'feedback.placeholder': 'Report a problem to the review loop (hard evidence)…',
+        'feedback.send': 'Send to review',
+        'feedback.ok': 'Sent into supervision review loop',
+        'feedback.fail': 'Feedback failed: ',
+        'diag.title': 'Browser error uploads (recent)',
+        'diag.empty': 'No browser errors reported',
       },
     };
     function pickLocale(ctx) {
@@ -148,6 +166,9 @@ window.__ModuleLoader__.load({
       if (ev.kind === 'verdict') return `[${d.verdict}] ${d.summary || ''}`;
       if (ev.kind === 'handover') return `${ev.pairName || ev.pairId} · ${d.side === 'worker' ? t('worker') : t('supervisor')} → ${t('new')} ${(d.newId || '').slice(8, 16)}`;
       if (ev.kind === 'halted') return d.reason || '';
+      if (ev.kind === 'client-error') return `UI: ${d.message || ''}`;
+      if (ev.kind === 'user-review') return `客户: ${d.text || ''}`;
+      if (ev.kind === 'requirement') return `验收: ${(d.acceptance || []).join(' / ') || d.note || ''}`;
       if (ev.kind === 'stopped') return `${ev.pairId} stopped`;
       return ev.kind;
     }
@@ -182,8 +203,26 @@ window.__ModuleLoader__.load({
       const [selected, setSelected] = useState(null);
       const [auto, setAuto] = useState(true);
       const [rev, setRev] = useState(0);
+      const [feedback, setFeedback] = useState('');
+      const [feedbackMsg, setFeedbackMsg] = useState('');
 
       const t = useCallback((key) => (DICT[lang] && DICT[lang][key]) || DICT.zh[key] || key, [lang]);
+
+      const sendFeedback = useCallback(async () => {
+        const value = feedback.trim();
+        if (!value) return;
+        try {
+          const res = await fetch(API, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ type: 'ui-review', text: value }),
+          });
+          if (!res.ok) throw new Error(String(res.status));
+          setFeedback('');
+          setFeedbackMsg(t('feedback.ok'));
+          setRev((x) => x + 1);
+        } catch (e) { setFeedbackMsg(t('feedback.fail') + String((e && e.message) || e)); }
+      }, [feedback, t]);
 
       useEffect(() => {
         try {
@@ -205,7 +244,13 @@ window.__ModuleLoader__.load({
         try {
           const res = await fetch(`${API}?limit=400`, { headers: { accept: 'application/json' } });
           if (!res.ok) throw new Error(String(res.status));
-          setData(await res.json());
+          const payload = await res.json();
+          let errors = [];
+          try {
+            const eres = await fetch(`${API}?kind=client-error&limit=50`, { headers: { accept: 'application/json' } });
+            if (eres.ok) errors = (await eres.json()).reports || [];
+          } catch {}
+          setData({ ...payload, errors });
           setError('');
         } catch (e) { setError(String((e && e.message) || e)); }
       }, []);
@@ -239,12 +284,30 @@ window.__ModuleLoader__.load({
           h('p', null, t('subtitle')),
         ),
         h('div', { className: 'sus-bar' },
-          chip('all'), chip('pair'), chip('review'), chip('needs_fix'), chip('complete'), chip('halted'), chip('handover'),
+          chip('all'), chip('pair'), chip('review'), chip('needs_fix'), chip('complete'), chip('halted'), chip('handover'), chip('client-error'), chip('user-review'), chip('requirement'),
           h('input', { className: 'sus-input', placeholder: t('search'), value: text, onChange: (e) => setText(e.target.value) }),
           h('button', { className: 'sus-chip', onClick: () => setAuto((x) => !x), 'data-on': auto ? '1' : '0' }, t('auto')),
           h('button', { className: 'sus-chip', onClick: () => setRev((x) => x + 1) }, t('refresh')),
         ),
         error ? h('div', { className: 'sus-badge', 'data-k': 'halted' }, t('error'), error) : null,
+        h('div', { className: 'sus-bar' },
+          h('input', {
+            className: 'sus-input', placeholder: t('feedback.placeholder'), value: feedback,
+            onChange: (e) => setFeedback(e.target.value),
+            onKeyDown: (e) => { if (e.key === 'Enter') sendFeedback(); },
+          }),
+          h('button', { className: 'sus-chip', onClick: sendFeedback }, t('feedback.send')),
+          feedbackMsg ? h('span', { className: 'sus-muted' }, feedbackMsg) : null,
+        ),
+        h('div', { className: 'sus-card', style: { marginBottom: 14 } },
+          h('b', null, t('diag.title')),
+          !data ? h('div', { className: 'sus-muted' }, t('loading')) : null,
+          data && (!data.errors || data.errors.length === 0) ? h('div', { className: 'sus-muted' }, t('diag.empty')) : null,
+          data && (data.errors || []).slice(0, 6).map((ev) => h('div', { className: 'sus-kv', key: ev.id },
+            h('span', { className: 'sus-muted' }, fmtTime(ev.at)),
+            h('span', { style: { color: '#fca5a5', marginLeft: 8 } }, `${ev.pairId ? `[${ev.pairId}] ` : ''}${(ev.data && ev.data.message) || ''}`),
+          )),
+        ),
         h('h3', { style: { margin: '4px 0 8px', fontSize: 14 } }, t('pairs'), data ? ` (${(data.pairs || []).length})` : ''),
         h('div', { className: 'sus-grid' },
           !data ? h('div', { className: 'sus-spin' }, t('loading')) : null,
@@ -274,6 +337,9 @@ window.__ModuleLoader__.load({
             h('h3', { style: { margin: '0 0 8px', fontSize: 14 } }, t('detail.title')),
             !selected ? h('div', { className: 'sus-muted' }, t('detail.empty')) : h('div', null,
               h('div', { className: 'sus-muted', style: { marginBottom: 8 } }, selTitle),
+              d.message ? h('div', null, h('h4', null, 'error'), h('pre', null, `${d.message}\n${d.stack || ''}`), d.pageUrl ? h('pre', null, d.pageUrl) : null) : null,
+              d.text ? h('div', null, h('h4', null, t('summary')), h('pre', null, d.text)) : null,
+              d.acceptance ? h('div', null, h('h4', null, t('requirement')), h('pre', null, (d.acceptance || []).join('\n') + (d.note ? `\n${d.note}` : ''))) : null,
               d.requirement ? h('div', null, h('h4', null, t('requirement')), h('pre', null, d.requirement)) : null,
               d.trigger ? h('div', null, h('h4', null, t('trigger')), h('pre', null, d.trigger)) : null,
               d.summary ? h('div', null, h('h4', null, t('summary')), h('pre', null, d.summary)) : null,
@@ -291,10 +357,36 @@ window.__ModuleLoader__.load({
       );
     }
 
-    // Error boundary: a render failure must show the message in-panel, not blank the page.
+    // ---- browser-side error capture: page crashes become review-loop evidence ----
+    let lastErrAt = 0; let lastErr = '';
+    function uploadError(message, stack, extra) {
+      try {
+        const now = Date.now();
+        if (message === lastErr && now - lastErrAt < 30000) return;
+        lastErr = message; lastErrAt = now;
+        const payload = JSON.stringify({
+          type: 'ui-error', message: String(message || 'unknown').slice(0, 800),
+          stack: String(stack || '').slice(0, 3000), pageUrl: String(location.href).slice(0, 300), extra: extra ? String(extra).slice(0, 300) : '',
+        });
+        if (navigator.sendBeacon) navigator.sendBeacon(API, new Blob([payload], { type: 'text/plain' }));
+        else fetch(API, { method: 'POST', body: payload, keepalive: true }).catch(() => {});
+      } catch {}
+    }
+    window.addEventListener('error', (e) => {
+      const msg = (e && e.message) || '';
+      if (msg.indexOf('/api/session-supervisor') >= 0) return; // don't loop on our own fetch failures
+      uploadError(msg, e && e.error && e.error.stack);
+    });
+    window.addEventListener('unhandledrejection', (e) => {
+      const r = e && e.reason;
+      uploadError(`unhandled rejection: ${(r && r.message) || String(r)}`, r && r.stack);
+    });
+
+    // Error boundary: a render failure shows the message in-panel AND uploads it.
     class Boundary extends React.Component {
       constructor(props) { super(props); this.state = { error: null }; }
       static getDerivedStateFromError(error) { return { error }; }
+      componentDidCatch(error, info) { uploadError(`panel render: ${(error && error.message) || error}`, (error && error.stack) || '', info && info.componentStack); }
       render() {
         if (this.state.error) {
           return h('div', { style: { padding: 24, color: '#fca5a5' } },
