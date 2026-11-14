@@ -98,10 +98,12 @@ pending-card -> working --(执行会话 supervision_done 一次)--> reviewing
 
 ```powershell
 cd D:\aipcb\session-supervisor
-node .verify\pairing-test.mjs        # 29 项：并发纳入 1 会话、达线只开 1 会话、老会话停止+退休、重启复原、真实 journal 去重、dormant 复用
+node .verify\pairing-test.mjs        # 44 项：并发纳入 1 会话、达线只开 1 会话（执行侧+监督侧各自）、老会话停止+退休、
+                                     #     接力后补送角色卡、重启复原、真实 journal 去重、dormant 复用
+$env:DSH_WEB_URL='http://127.0.0.1:<端口>'; node .verify\live-1to1-check.mjs <pairId>   # 真机在线复核（只读）：活体对 1:1 自检 + 退休会话名单
 ```
 
-改动生效证据自查：`supervision_status` 里 `pairing.oneToOne` 与 `pairing.conflicts`；`supervision_reports kind=pairing` 看 `reused / duplicate-pair / drop-extra-session / hydrate / retired-session-touched` 流水。
+改动生效证据自查：`supervision_status` 里 `pairing.oneToOne` 与 `pairing.conflicts`；`supervision_reports kind=pairing` 看 `reused / duplicate-pair / drop-extra-session / hydrate / retired-session-touched / stop-retired-session` 流水。
 
 ### 6. 回滚
 
@@ -164,11 +166,16 @@ needs_fix 还必须给 `fixInstructions`；整改指令带监督逐项核验记�
 3. **达线自动匹配新会话**：`handoverIfNeeded()` 同侧单飞（`pair.rolling`）+ 冷却 + 竞态丢弃多开的会话；看门狗在**双方空闲点**、执行侧 `turn/end` 后都会接力（不再只在评审时判水位）；水位口径含「本轮交接卡是否已送达旧会话」，旧会话没清场就不算降级（否则会反复开会话）。
 4. **老会话停止运行**：接力后 `stopRetiredSide()` → `markRetired()` + `stopSessionRun()`（`agent.cancel` + `sessionController.cancel`）；`serialDeliver` 投递前 `deliveryBlocker()` 拦住退休/非本侧会话；客户手误在退休会话里输入 → `onRetiredEvent()` 取消运行并只回「请到 <活体会话> 继续」。
 
-重启 / 插件重转不再丢配对：`hydratePairsFromJournal()` 从持久 journal 重放事件重建注册表，重复对当场收口；静默超 `dormantAfterMs`（默认 6h）的老对转 `dormant`（不再自动跑），该执行会话再 `supervision_done` / `supervision_enroll` 即 `reopenPair()` **复用原监督会话**。回归：`node .verify/pairing-test.mjs`（29 项，含用本机真实 `reports.json` 跑的重建 + 去重）。
+重启 / 插件重转不再丢配对：`hydratePairsFromJournal()` 从持久 journal 重放事件重建注册表，重复对当场收口；静默超 `dormantAfterMs`（默认 6h）的老对转 `dormant`（不再自动跑），该执行会话再 `supervision_done` / `supervision_enroll` 即 `reopenPair()` **复用原监督会话**。回归：`node .verify/pairing-test.mjs`（47 项，含用本机真实 `reports.json` 跑的重建 + 去重）。
+
+### 3.1 接力后的会话拿到什么（1.1.1）
+
+- 新会话先收**自包含交接卡**（原始需求 + 对账状态 + 上次结论 + 最近 40 行日志摘录），紧着再补送**完整角色卡**（执行侧纪律 / 监督评审协议），不会因为「只有一张交接卡」而丢掉「只能调 supervision_verdict / 完成后调 supervision_done」这类硬约束。
+- 停止动作全程留痕：接力时 `stop-retired-session`（`stopped: true/false`）、退休会话被再次使用时同样一行；`supervision_status.retiredSessions` 与 `/api/session-supervisor` 都带 `stopped` 字段，客户不用看代码就能确认「老会话真的停了」。
 
 ## 上下文接力（默认 240k；客户模型上限 254k，留余量）
 
-双方水位（`tokenMeter.contextPressure`）达 `maxContextTokens` → 同 Workspace 自动开**一个**新会话（单飞 + 冷却，绝不叠加）：送达**自包含交接卡**（角色卡+原始需求+验收清单+对账状态+最近 40 行日志摘录）；**旧会话被停止运行并改名「（已接力）」**，永久绑在原对上（`retired` 表 + `bindings.json`），不会再被自动纳入；`supervision_status.lineage` / `retiredSessions` 记录链路。接力上限 `maxHandovers`（默认 8）。
+双方水位（`tokenMeter.contextPressure`）达 `maxContextTokens` → 同 Workspace 自动开**一个**新会话（单飞 + 冷却，绝不叠加）：送达**自包含交接卡**（角色卡+原始需求+验收清单+对账状态+最近 40 行日志摘录）；**旧会话被停止运行并改名「（已接力）」**（`stop-retired-session` 事件 + `retiredSessions[].stopped` 可直接审计），永久绑在原对上（`retired` 表 + `bindings.json`），不会再被自动纳入；`supervision_status.lineage` / `retiredSessions` 记录链路。接力上限 `maxHandovers`（默认 8）。
 
 ## 防死循环熔断（多重保险）
 

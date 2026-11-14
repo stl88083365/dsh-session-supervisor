@@ -205,7 +205,7 @@ export function apply(ctx, rawConfig = {}) {
     return info?.pairId ?? null
   }
   const roleOfSide = (sessionId) => (byWorker.get(sessionId) ? "worker" : bySupervisor.get(sessionId) ? "supervisor" : (retired.get(sessionId) ?? bindingState.get(sessionId))?.role ?? null)
-  const retiredSides = (pair) => (pair.lineage ?? []).filter((row) => row?.previousId).map((row) => ({ sessionId: row.previousId, side: row.side, relayedTo: row.newId ?? null, at: row.at ?? null }))
+  const retiredSides = (pair) => (pair.lineage ?? []).filter((row) => row?.previousId).map((row) => ({ sessionId: row.previousId, side: row.side, relayedTo: row.newId ?? null, at: row.at ?? null, stopped: row.stopped ?? false }))
   const pairingSummary = (pair) => {
     const ids = new Set([pair.workerId, pair.supervisorId])
     const active = [...pairs.values()].filter((other) => other.state === "active")
@@ -558,11 +558,16 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   const retiredNoticeAt = new Map()
-  /** 退休一侧会话：标记 retired + 取消在跑的这一轮（老会话停止运行）。 */
+  /** 退休一侧会话：标记 retired + 取消在跑的这一轮（老会话停止运行），并把结果写进 journal 可审计。 */
   async function stopRetiredSide(pair, role, previousId, reason) {
     markRetired(previousId, pair, role)
-    if (config.stopRetiredSession) await stopSessionRun(previousId, reason)
-    warn("retired " + role + " session stopped: " + previousId + " (pair " + pair.id + ")")
+    let stopped = false
+    if (config.stopRetiredSession) stopped = await stopSessionRun(previousId, reason)
+    else warn("stop retired session skipped by config: " + previousId)
+    recordPairing(pair, { action: "stop-retired-session", role, sessionId: previousId, stopped, reason: snippet(reason, 120) })
+    if (!stopped) warn("retired " + role + " session NOT stopped: " + previousId + " (pair " + pair.id + ")")
+    else warn("retired " + role + " session stopped: " + previousId + " (pair " + pair.id + ")")
+    return stopped
   }
 
   async function handoverIfNeeded(pair, side) {
@@ -601,7 +606,8 @@ export function apply(ctx, rawConfig = {}) {
       const previousEvents = role === "worker" ? await workerEvents(pair) : []
       const tail = digestLinesOf(previousEvents).slice(-40).join("\n")
       pair.handovers += 1
-      pair.lineage.push({ side: role, number, previousId, newId, at: Date.now() })
+      const lineageRow = { side: role, number, previousId, newId, at: Date.now(), stopped: false }
+      pair.lineage.push(lineageRow)
       recordReport("handover", pair, { side: role, number, previousId, newId })
       if (role === "worker") {
         byWorker.delete(previousId)
@@ -617,13 +623,18 @@ export function apply(ctx, rawConfig = {}) {
         setTitle(newId, "监督#" + number + "｜" + pair.name)
       }
       bindSession(newId, pair, role)
-      await stopRetiredSide(pair, role, previousId, "上下文接力：旧会话停止运行")
+      lineageRow.stopped = await stopRetiredSide(pair, role, previousId, "上下文接力：旧会话停止运行")
       setTitle(previousId, (role === "worker" ? "执行#" : "监督#") + number + "（已接力）｜" + pair.name)
       pair.lastHandoverAt = Date.now()
       if (role === "worker") pair.lastWorkerHandoverAt = pair.lastHandoverAt
       else pair.lastSupervisorHandoverAt = pair.lastHandoverAt
       const delivered = await serialDeliver(pair, "handover", newId, handoverCard(pair, role, tail || "（无摘录）"))
       if (!delivered) warn("handover card delivery skipped (" + pair.id + " " + role + ")")
+      // 接力会话同时补送完整角色卡（执行纪律 / 监督评审协议），否则新会话只有一张交接卡，
+      // 拿不到「只能调 supervision_verdict / 完成后调 supervision_done」这类硬约束。
+      else serialDeliver(pair, role === "worker" ? "worker-card" : "supervisor-card", newId, role === "worker" ? workerCard(pair) : supervisorCard(pair))
+        .then((ok) => { if (!ok) warn("role card after handover skipped (" + pair.id + " " + role + ")") })
+        .catch((error) => warn("role card after handover failed (" + pair.id + " " + role + ")", error))
       warn("handover #" + number + " (" + role + ") " + previousId + " -> " + newId)
       return true
     } finally {
@@ -645,7 +656,14 @@ export function apply(ctx, rawConfig = {}) {
     const roleText = info.role === "worker" ? "执行" : "监督"
     recordPairing(pair, { action: "retired-session-touched", role: info.role, sessionId: session.id, live: liveId, text: snippet(contentText(event?.data?.content, 200), 200) })
     warn("retired " + roleText + " session touched again: " + session.id + " (pair " + pair.id + ")")
-    if (config.stopRetiredSession) stopSessionRun(session.id, "retired session touched").catch(() => {})
+    if (config.stopRetiredSession) {
+      stopSessionRun(session.id, "retired session touched")
+        .then((stopped) => {
+          recordPairing(pair, { action: "stop-retired-session", role: info.role, sessionId: session.id, stopped, reason: "retired session touched" })
+          if (!stopped) warn("retired " + roleText + " session still running (cancel failed): " + session.id)
+        })
+        .catch((error) => warn("stop retired session failed", error))
+    }
     retiredNoticeAt.set(session.id, Date.now())
     serialDeliver(pair, "retired-notice", session.id, [
       "【会话监督】本会话是监督对 " + pair.id + " 的旧" + roleText + "会话，上下文达线后已接力并停止运行。",
@@ -959,7 +977,8 @@ export function apply(ctx, rawConfig = {}) {
         ? `${requirement}\n\n【验收清单】\n${acceptanceList.map((line) => `- ${line}`).join('\n')}`
         : requirement,
       requirements: [{ at: Date.now(), source: 'start', text: acceptanceList.length ? `${requirement}\n验收清单: ${acceptanceList.join(' | ')}` : requirement }],
-      reviewers: [fields.supervisorId],
+      // v3: 不再保留只写不读的 reviewers 死字段；监督侧的全部历史（含接力/重开）统一由 lineage 记账，
+      // 1:1 约束由 bySupervisor / pairingConflicts / enforceOneToOne 三处共同把守。
       lastErrorScanAt: Date.now(),
       cwd: fields.cwd ?? null,
       workerId: fields.workerId,
@@ -1147,7 +1166,6 @@ export function apply(ctx, rawConfig = {}) {
         pair.supervisorId = newSupervisorId
         bySupervisor.set(newSupervisorId, pair)
         bindSession(newSupervisorId, pair, 'supervisor')
-        pair.reviewers.push(newSupervisorId)
         pair.lineage.push({ side: 'supervisor', number: (handoverSeq += 1), previousId: previousSupervisorId, newId: newSupervisorId, at: Date.now(), reason: 'reopen' })
         setTitle(newSupervisorId, `监督（重开）｜${pair.name}`)
         if (previousSupervisorId) markRetired(previousSupervisorId, pair, 'supervisor')
@@ -1886,7 +1904,8 @@ export function apply(ctx, rawConfig = {}) {
         lastVerdict: pair.lastVerdict,
         createdAt: pair.createdAt,
         lineage: pair.lineage,
-        retiredSessions: retiredSides(pair).map((row) => row.previousId),
+        // 与工具面 pairView 同构（曾是 .map(row => row.previousId) -> 序列化成 [null]，面板拿不到会话）
+        retiredSessions: retiredSides(pair),
         pairing: pairingSummary(pair),
       })),
       reports: events.slice(0, limit),

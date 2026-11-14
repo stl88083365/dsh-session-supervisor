@@ -3,6 +3,7 @@ node_modules/
 .git/
 .verify/*
 !.verify/pairing-test.mjs
+!.verify/live-1to1-check.mjs
 *.bak
 *.bak-*
 .local/
