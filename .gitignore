@@ -5,3 +5,4 @@ node_modules/
 !.verify/pairing-test.mjs
 *.bak
 *.bak-*
+.local/
