@@ -2,4 +2,6 @@
 - insert:
     - id: session-supervisor
       name: '@local/dsh-session-supervisor'
-      config: {}
+      config:
+        maxFixRounds: 8
+        maxReviews: 24

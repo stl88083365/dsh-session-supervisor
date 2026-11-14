@@ -1,3 +1,7 @@
 node_modules/
 *.tgz
 .git/
+.verify/*
+!.verify/pairing-test.mjs
+*.bak
+*.bak-*

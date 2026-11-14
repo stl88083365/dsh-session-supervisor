@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Session supervisor",
-    "description": "Pairs an executor session with a supervisor session: the supervisor reviews every turn, judges completion, and dispatches bug-fix instructions automatically."
+    "description": "One executor session to exactly one supervisor session (hard 1:1; restarts and concurrent enrollment cannot open a second pair). The supervisor reviews only after supervision_done, reproducing every acceptance item itself; needs_fix dispatches fix instructions serially. When context reaches maxContextTokens the plugin rolls over to one new session and immediately stops/retires the old one."
   }
 }
