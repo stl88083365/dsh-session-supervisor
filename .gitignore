@@ -4,6 +4,12 @@ node_modules/
 .verify/*
 !.verify/pairing-test.mjs
 !.verify/live-1to1-check.mjs
+!.verify/stall-test.mjs
+!.verify/context-test.mjs
+!.verify/split-test.mjs
+!.verify/overflow-test.mjs
+!.verify/overflow-re.mjs
+!.verify/text-toolcall-test.mjs
 *.bak
 *.bak-*
 .local/

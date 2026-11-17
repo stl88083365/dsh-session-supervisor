@@ -7,6 +7,8 @@ import { pathToFileURL, fileURLToPath } from "node:url"
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 const SRC = path.join(ROOT, "index.js")
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+// 显式等信号：这个套件的桩没有 host.waitFor，本地补一个（轮询但带充足窗口）
+const waitFor = async (fn, tries = 200, step = 60) => { for (let i = 0; i < tries; i += 1) { if (await fn()) return true; await wait(step) } return false }
 
 function fakeHost(profile) {
   fs.rmSync(profile, { recursive: true, force: true })
@@ -97,7 +99,7 @@ async function testsOnFreshInstance() {
   const profile = path.join(os.tmpdir(), "sup-1to1-" + Date.now().toString(36))
   const host = fakeHost(profile)
   const module = await loadPlugin(profile)
-  module.apply(host.ctx, { maxContextTokens: 5000, idleNudgeMs: 0, idleForceReviewMs: 0, rolloverCooldownMs: 0 })
+  module.apply(host.ctx, { maxContextTokens: 5000, idleNudgeMs: 0, idleForceReviewMs: 0, rolloverCooldownMs: 0, channelGuard: false })
   __host = host
 
   // T1 同一个执行会话并发 supervision_enroll -> 只允许一个监督会话（1 执行 <-> 1 监督）
@@ -190,28 +192,32 @@ async function testsOnFreshInstance() {
     fixInstructions: "补齐交付物并附真实命令输出，见 index.js 与 README.md",
     checklist: [{ item: "交付物存在", verified: "failed", evidence: "Get-ChildItem D:/tmp/a.txt 返回空" }],
   }, oldSup).catch((error) => host.logs.push("verdict skipped: " + error))
-  await wait(300)
+  // 显式等信号：结论必须被接受、评审轮必须真的收口（busy=false）。
+  // 旧写法只 wait(300) 就去改水位，一旦被「反假完成门槛」打回 / 上一轮还没 release，
+  // pair.busy 一直为 true → 后面 runReview 直接 return → T4b 全组超时（独占跑偶发、并发跑必现）。
+  const pairNow = async () => (await host.pairs()).find((row) => row.pairId === target.pairId)
+  const verdictOk = await waitFor(async () => {
+    const row = await pairNow()
+    return !String(host.logs.at(-8) ?? "").startsWith("verdict skipped") && row?.serial?.reviewInFlight === false
+  }, 400)
+  check("T4b 前置：needs_fix 已接受且评审轮已收口（busy=false）", verdictOk,
+    "reviewInFlight=" + (await pairNow())?.serial?.reviewInFlight + " skipped=" + host.logs.filter((l) => String(l).startsWith("verdict skipped")).slice(-1))
   host.setPressure(oldSup, 9000)
   host.setPressure(liveWorker, 1000)
   const before6 = host.created.length
   const cancelsBefore6 = host.cancels.length
   const promptsBefore6 = host.prompts.length
   await host.call("supervision_done", { summary: "第二轮：已补做，dir 输出 a.txt 存在（证据 C:/tmp/a.txt）" }, liveWorker)
+  // 显式等信号：等「监督侧真的换到新会话」，而不是固定轮询窗口
+  const switched = await waitFor(async () => {
+    const row = await pairNow()
+    return !!row && row.supervisorSessionId !== oldSup
+  }, 400)
   let newSup = oldSup
-  for (let i = 0; i < 160; i += 1) {
-    const view = (await host.pairs()).find((row) => row.pairId === target.pairId)
-    if (view && view.supervisorSessionId !== oldSup) { newSup = view.supervisorSessionId; break }
-    await wait(150)
-  }
-  for (let i = 0; i < 60; i += 1) {
-    if (host.deliveriesTo(newSup).some((row) => row.requestId.startsWith("sup:handover"))) break
-    await wait(200)
-  }
+  if (switched) newSup = (await pairNow()).supervisorSessionId
+  await waitFor(() => host.deliveriesTo(newSup).some((row) => row.requestId.startsWith("sup:handover")), 200)
   // 角色卡走串行队列（每次投递后固定 1.5s 间隔），先等它落队再断言
-  for (let i = 0; i < 80; i += 1) {
-    if (host.deliveriesTo(newSup).some((row) => row.requestId.startsWith("sup:supervisor-card"))) break
-    await wait(200)
-  }
+  await waitFor(() => host.deliveriesTo(newSup).some((row) => row.requestId.startsWith("sup:supervisor-card")), 250)
   const viewB6 = (await host.pairs()).find((row) => row.pairId === target.pairId)
   check("T4b 监督达线只新开 1 个会话", host.created.length - before6 === 1, "created+" + (host.created.length - before6))
   check("T4b 监督侧已切到新会话", !!newSup && newSup !== oldSup, oldSup + " -> " + newSup)
@@ -241,8 +247,16 @@ async function testsOnFreshInstance() {
   check("T4b 监督接力后 1:1 复核", viewB7.pairing?.oneToOne === true && viewB7.supervisorSessionId === newSup, JSON.stringify(viewB7.pairing))
 
   // T4c 「老会话停止」必须留痕：journal 里每条接力都有一行 stop-retired-session（stopped=true），pairView 的 retiredSessions 也带标记
-  await wait(700)
-  const jrows = JSON.parse(fs.readFileSync(path.join(profile, "session-supervisor", "reports.json"), "utf8")).events.filter((e) => e.kind === "pairing")
+  // 显式等信号：两侧退休记录都落盘（执行+监督各 1），不靠固定 sleep 撞时机
+  const journalPath = path.join(profile, "session-supervisor", "reports.json")
+  const pairingRows = () => {
+    try { return JSON.parse(fs.readFileSync(journalPath, "utf8")).events.filter((e) => e.kind === "pairing") } catch { return [] }
+  }
+  await waitFor(() => {
+    const rows = pairingRows().filter((e) => e.data?.action === "stop-retired-session" && String(e.data?.reason ?? "").includes("接力"))
+    return rows.length >= 2
+  }, 200)
+  const jrows = pairingRows()
   const stops = jrows.filter((e) => e.data?.action === "stop-retired-session")
   const relayStops = stops.filter((e) => String(e.data?.reason ?? "").includes("接力"))
   check("T4c journal 记 stop-retired-session（执行+监督接力各 1，stopped=true）", relayStops.length === 2 && relayStops.every((e) => e.data.stopped === true), "relayStops=" + relayStops.map((e) => e.data.role + ":" + e.data.stopped).join(",") + " allStops=" + stops.length)
@@ -260,7 +274,7 @@ async function testRealJournalHydration() {
   fs.mkdirSync(path.join(profile, "session-supervisor"), { recursive: true })
   fs.copyFileSync(src, path.join(profile, "session-supervisor", "reports.json"))
   const module = await loadPlugin(profile)
-  module.apply(host.ctx, { dormantAfterMs: 21600000 })
+  module.apply(host.ctx, { dormantAfterMs: 21600000, channelGuard: false })
   await wait(900)
   const status = await host.pairs()
   check("T5 重启后按 journal 复原监督对", status.length > 0, "pairs=" + status.length)

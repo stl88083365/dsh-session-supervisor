@@ -24,11 +24,19 @@
  *   - supervision_start/enroll refuse to run from a session already inside any
  *     pair, so neither role can fork new pairs.
  *
- * Context rollover: both sides' token pressure (tokenMeter.contextPressure) is
- * measured when both are idle; at/above maxContextTokens the plugin mints a
- * fresh successor session (same Workspace), serially delivers a self-contained
- * handover card (role + requirement + progress + recent log tail), and renames
- * the old session with "（已接力）". Lineage stays in supervision_status.
+ * Context rollover (v3.1, rewritten after the 2026-11-15 blow-up): pressure is
+ * read from four sources — provider-reported pressureTokens, projectedTokens,
+ * tokenMeter.measure().totalTokens (works even when the provider reports zero
+ * usage, which is exactly what silently disabled this guard before), and a last
+ * resort surface estimate from the durable events. The threshold follows the
+ * route's real contextWindow (window - contextReserveTokens, capped by
+ * maxContextTokens). Rollover triggers at idle turn ends, the watchdog, before
+ * each review, and BEFORE every delivery (checked outside the serial chain, so
+ * it cannot self-lock). Every message the plugin pushes is measured against the
+ * target's remaining budget and trimmed to fit (journal: delivery-trim /
+ * pressure-wall). A CONTEXT_WINDOW_EXCEEDED error relays immediately through
+ * relayOnOverflow() instead of being counted as a model error, so a saturated
+ * session is replaced rather than halted.
  *
  * Auto-enrollment (customer spec, v2): a NEW session whose first real customer
  * message says 「需要审查」 is enrolled automatically — the plugin creates the
@@ -46,8 +54,13 @@
  * a pair.
  *
  * Row config (raw passthrough, no schema):
- * { maxFixRounds: 3, reviewEnabled: true, digestMaxChars: 10000,
- *   maxContextTokens: 240000, maxHandovers: 8, maxReviews: 12,
+ * { maxFixRounds: 3, reviewEnabled: true, digestMaxChars: 6000,
+ *   maxContextTokens: 240000, contextReserveTokens: 60000, minContextTokens: 12000,
+ *   contextSafetyRatio: 0.5, deliverMaxChars: 12000, reviewMaxChars: 20000,
+ *   handoverMaxChars: 9000, requirementMaxChars: 4000, checklistNoteMaxChars: 2200,
+ *   fixSummaryMaxChars: 1500, fixInstrMaxChars: 3000, workerLogMaxChars: 9000,
+ *   handoverTailLines: 25, overflowRelay: true,
+ *   maxHandovers: 8, maxReviews: 12,
  *   serialWaitMs: 1800000, reviewTurnTimeoutMs: 900000,
  *   autoEnrollReview: true, reviewTriggerPattern: '需要审查',
  *   idleNudgeMs: 120000, idleForceReviewMs: 300000, completeSummaryMinChars: 40 }
@@ -66,16 +79,49 @@ export const inject = ['tools', 'agents', 'sessions', 'sessionController', 'sess
 const pickNumber = (value, fallback, min = 0) =>
   typeof value === 'number' && Number.isFinite(value) && value >= min ? Math.floor(value) : fallback
 
+const pickRatio = (value, fallback, min = 0.01, max = 0.99) =>
+  typeof value === 'number' && Number.isFinite(value) && value >= min && value <= max ? value : fallback
+
 export function apply(ctx, rawConfig = {}) {
   const config = {
     maxFixRounds: pickNumber(rawConfig?.maxFixRounds, 3, 1),
     reviewEnabled: rawConfig?.reviewEnabled !== false,
-    digestMaxChars: pickNumber(rawConfig?.digestMaxChars, 10000, 500),
+    digestMaxChars: pickNumber(rawConfig?.digestMaxChars, 6000, 500),
     maxContextTokens: pickNumber(rawConfig?.maxContextTokens, 240000, 1000),
     maxHandovers: pickNumber(rawConfig?.maxHandovers, 8, 1),
     maxReviews: pickNumber(rawConfig?.maxReviews, 12, 2),
     serialWaitMs: pickNumber(rawConfig?.serialWaitMs, 1800000, 5000),
-    reviewTurnTimeoutMs: pickNumber(rawConfig?.reviewTurnTimeoutMs, 900000, 30000),
+    // 串行闸门最多等多久就放弃这次投递（挂成待重投）。旧版死等 serialWaitMs(30min)：
+    // 执行侧一跑长轮，后面所有投递（包括超时通知）全被堵在单链上，实测 2 小时没动静。
+    deferAfterMs: pickNumber(rawConfig?.deferAfterMs, 120000, 1000),
+    // v3.3 投递排队（修「监督不起作用」）：闸门只给短暂宽限期，等不到就【入库排队】，
+    // 不占用全局串行链；排队不许丢；长时间抢不到通道就强行放行（宿主本来会自己排队）。
+    // v3.4：宽限期只用于「评审材料构建前的短暂静默」；投递闸门改成【立刻判定、不等】，
+    // 所以这里默认压到 5s（旧 20s：闸门在链里死等，整条链被吃死，实测就是「监督不起作用」）。
+    pairIdleGraceMs: pickNumber(rawConfig?.pairIdleGraceMs, 5000, 500),
+    // 排队条目的补发节拍：parking 后自己挂一个定时器，不再等看门狗（看门狗 15~20s 才扫一遍）
+    drainRetryMs: pickNumber(rawConfig?.drainRetryMs, 2500, 250),
+    channelGraceMs: pickNumber(rawConfig?.channelGraceMs, 20000, 2000),
+    channelMaxWaitMs: pickNumber(rawConfig?.channelMaxWaitMs, 600000, 1000),
+    channelStaleMs: pickNumber(rawConfig?.channelStaleMs, 300000, 30000),
+    pendingDeliveryMax: pickNumber(rawConfig?.pendingDeliveryMax, 6, 1),
+    // 全宿主单通道闸门：默认【开】。客户口径（2026-11-16 01:00）：本地模型只有一个推理通道，
+    // 两个会话同时调用会把两边一起拖死，所以监督的投递必须串行排队。
+    // v3.4 起「排队」不再等于「停摆」：闸门同步判定→立刻入 FIFO 队列（不占全局串行链、不丢、不乱序），
+    // 通道一空（agent/status 空闲事件）或后台节拍（drainRetryMs）就补发；压过 channelMaxWaitMs 强行放行。
+    // 关掉（channelGuard=false）= 只做对内串行，跨会话不排队。
+    channelGuard: rawConfig?.channelGuard !== false,
+    reviewTurnTimeoutMs: pickNumber(rawConfig?.reviewTurnTimeoutMs, 2700000, 30000),
+    // v3.2 卡死收口（2026-11-15 实测事故：sup-2-vd699 评审轮超时 8 次 / 卡在 reviewing 2 小时）：
+    // 评审超时必须收口释放 busy，且次数有上限；执行侧单轮也要有超时（旧版 worker running 时完全静默）。
+    // 默认放宽到 45min×3：单通道本机实测一轮评审要 30~40min（排队 + 十几项服务端取证），
+    // 旧值 30min×2 会把正常在跑的评审误杀成 halted（11-16 客户报「监督不起作用」就是这个）。
+    maxReviewTimeouts: pickNumber(rawConfig?.maxReviewTimeouts, 3, 1),
+    workerTurnTimeoutMs: pickNumber(rawConfig?.workerTurnTimeoutMs, 2700000, 60000),
+    maxWorkerTimeouts: pickNumber(rawConfig?.maxWorkerTimeouts, 2, 1),
+    // 绝对上限：从评审材料送达算起，无论是否有进展，超过这个时长一定中止该轮
+    // （进展豁免只该豁免「慢」，不该豁免「永远不收敛」）。
+    reviewHardCapMs: pickNumber(rawConfig?.reviewHardCapMs, 7200000, 60000),
     // 首条客户消息含「需要审查」→ 自动纳入监督
     autoEnrollReview: rawConfig?.autoEnrollReview !== false,
     reviewTriggerPattern: typeof rawConfig?.reviewTriggerPattern === 'string' ? rawConfig.reviewTriggerPattern : '需要审查',
@@ -90,7 +136,41 @@ export function apply(ctx, rawConfig = {}) {
     dormantAfterMs: pickNumber(rawConfig?.dormantAfterMs, 21600000, 60000),
     reuseCardCooldownMs: pickNumber(rawConfig?.reuseCardCooldownMs, 60000, 0),
     rolloverCooldownMs: pickNumber(rawConfig?.rolloverCooldownMs, 60000, 0),
+    // v1.2.4 客户设置的上下文大小（512K / 1M 这类）与「超限即分段」：
+    // >0 时它成为**唯一接力阈值**（仍受真实窗口 − 预留量夹住）；超过它就把剩余的活拆成有序分段，
+    // 每段换一个新会话逐段做，最后一段做完才进评审。0 = 关闭分段，退回旧的整段接力。
+    // （测试注意：pickNumber 的 min 是 1000，写低于 1000 的值会被判非法并回落成 0＝关闭。）
+    contextSplitTokens: pickNumber(rawConfig?.contextSplitTokens, 0, 1000),
+    contextSplitMaxParts: pickNumber(rawConfig?.contextSplitMaxParts, 6, 2),
+    contextSplitPartChars: pickNumber(rawConfig?.contextSplitPartChars, 0, 0),
+    // v1.3.0 文本工具调用守卫：模型有时把工具调用写成正文（<tool_call><function=…>），
+    // DSH 只执行结构化 tool-call → 这一轮 0 工具执行、却以 completed 收尾，表现就是
+    // 「任务没做完就停了」。插件层补一道：本侧注入纠正（点名真实 shell 工具 pwsh），
+    // 连续上限 textToolCallGuardMax(4)，干净一轮即清零。
+    textToolCallGuard: rawConfig?.textToolCallGuard !== false,
+    textToolCallGuardMax: pickNumber(rawConfig?.textToolCallGuardMax, 4, 1),
     retiredNoticeMs: pickNumber(rawConfig?.retiredNoticeMs, 300000, 0),
+    // v3.1 上下文防爆（2026-11-15 事故修复）：水位阈值跟随路由真实窗口，
+    // 投递前按剩余预算裁剪，溢出错误自动接力而不是熔断。
+    contextReserveTokens: pickNumber(rawConfig?.contextReserveTokens, 60000, 2000),
+    minContextTokens: pickNumber(rawConfig?.minContextTokens, 12000, 2000),
+    contextSafetyRatio: pickRatio(rawConfig?.contextSafetyRatio, 0.5),
+    deliverMaxChars: pickNumber(rawConfig?.deliverMaxChars, 12000, 1500),
+    reviewMaxChars: pickNumber(rawConfig?.reviewMaxChars, 20000, 3000),
+    handoverMaxChars: pickNumber(rawConfig?.handoverMaxChars, 9000, 1500),
+    requirementMaxChars: pickNumber(rawConfig?.requirementMaxChars, 4000, 500),
+    checklistNoteMaxChars: pickNumber(rawConfig?.checklistNoteMaxChars, 2200, 200),
+    fixSummaryMaxChars: pickNumber(rawConfig?.fixSummaryMaxChars, 1500, 200),
+    fixInstrMaxChars: pickNumber(rawConfig?.fixInstrMaxChars, 3000, 200),
+    workerLogMaxChars: pickNumber(rawConfig?.workerLogMaxChars, 9000, 1000),
+    handoverTailLines: pickNumber(rawConfig?.handoverTailLines, 25, 5),
+    overflowRelay: rawConfig?.overflowRelay !== false,
+    // v1.2.5 溢出自动续做：任何真会话撞上 `no room to answer` 这类 400，就自动开新会话接着做。
+    // 链深有上限（overflowContinueMax），同一会话有冷却，避免「一直溢出→一直开会话」。
+    overflowContinue: rawConfig?.overflowContinue !== false,
+    overflowContinueMax: pickNumber(rawConfig?.overflowContinueMax, 8, 1),
+    overflowContinueCooldownMs: pickNumber(rawConfig?.overflowContinueCooldownMs, 30000, 0),
+    continueCardMaxChars: pickNumber(rawConfig?.continueCardMaxChars, 9000, 1500),
   }
 
   // 触发词：需要审查/需审查/要审查/需要监督/审查监督 + 英文说法。
@@ -299,15 +379,165 @@ export function apply(ctx, rawConfig = {}) {
   }
   const kTokens = (value) => (typeof value === 'number' && Number.isFinite(value) ? `${Math.round(value / 1000)}k` : '?')
 
-  /** Live token pressure of one session; undefined when the session is cold or unmeasured. */
-  function contextTokens(sessionId) {
-    try {
-      const session = ctx.sessions.get(sessionId)
-      if (session === undefined) return undefined
-      return ctx.get('tokenMeter')?.contextPressure?.(session)?.pressureTokens
-    } catch {
-      return undefined
+  // ------------------------------------------------ context pressure (v3.1 防爆)
+  // 事故根因（2026-11-15 18:27，sup-1-9c6ry 执行侧）：provider 把 usage 全报成 0
+  // （assistant/attempt 里 `"usage":{"inputTokens":0,"outputTokens":0,"totalTokens":0}`），
+  // 于是 tokenMeter.contextPressure().pressureTokens 恒为 undefined，旧代码
+  // `contextTokens() ?? 0` 永远小于阈值 —— 达线接力形同虚设，会话一路涨到
+  // 536837 tokens，被 provider 以 CONTEXT_WINDOW_EXCEEDED 永久拒（DSH 自带压缩
+  // 也因为同样的 400 救不回来），最后插件只是把它记成「连续 3 次模型错误」熔断。
+  // 现在：provider 报的 → 投影(next-prompt)估值 → measure() 重定价总量 → 事件流字数估算，
+  // 四路取最大值；任何一路活着都能测出水位，全都没有才判未知。
+  const OVERFLOW_RE = /CONTEXT_WINDOW_EXCEEDED|context_length_exceeded|context window|too many(?: input)? tokens|maximum context length|prompt is too long|no room (?:to|for)/i
+  const isOverflow = (value) => {
+    if (!value) return false
+    const text = value instanceof Error ? `${value.name} ${value.message}` : typeof value === 'object' ? `${value.code ?? ''} ${value.name ?? ''} ${value.message ?? ''}` : String(value)
+    return OVERFLOW_RE.test(text)
+  }
+  /** 中英/代码混合码点近似：~3 字符/词元（保守取整）。 */
+  const charsToTokens = (chars) => Math.ceil((chars || 0) / 3)
+  const contentChars = (content) => {
+    if (typeof content === 'string') return content.length
+    if (!Array.isArray(content)) return 0
+    return content.reduce((sum, block) => sum + (block?.type === 'text' ? (block.text?.length ?? 0) : 0), 0)
+  }
+  /** 兜底估算：直接扫会话事件（provider 报 0 usage 且 measure() 也不在时的最后防线）。 */
+  function surfaceEstimate(session) {
+    let chars = 0
+    for (const event of session?.events ?? []) {
+      const data = event?.data ?? {}
+      chars += contentChars(data.content) + contentChars(data.message?.content)
+      if (event?.type === 'tool/call') chars += typeof data.arguments === 'string' ? data.arguments.length : (JSON.stringify(data.arguments ?? {}).length)
+      chars += 12 // 每条事件的角色框/序号开销
     }
+    return charsToTokens(chars)
+  }
+  const meter = () => { try { return ctx.get('tokenMeter') } catch { return undefined } }
+  /**
+   * 宿主公开的路由窗口可能比 provider 实际吃的要大（本机：声明 1M，实跑到 524288 就被拒）。
+   * provider 的 400 里带着真数字，抓到就当作这一侧的硬上限用。
+   */
+  const observedCeilings = new Map()
+  function parseWindowCeiling(detail) {
+    const text = String(detail ?? '')
+    const patterns = [
+      /prompt \((\d+) tokens?\)[^)]*?context[^\d(]*(\d{4,})/i,
+      /context \((\d{4,})\)/i,
+      /(?:context window|max(?:imum)? context(?: length)?)[^\d]{0,12}(\d{5,})\s*(?:tokens?|k\b)?/i,
+    ]
+    for (const re of patterns) {
+      const m = text.match(re)
+      const n = m ? Number(m[2] ?? m[1]) : NaN
+      if (Number.isFinite(n) && n >= 1000) return n
+    }
+    return undefined
+  }
+  const ceilingOf = (sessionId) => observedCeilings.get(sessionId)
+  const windowOf = (sessionId, declared) => {
+    const ceiling = ceilingOf(sessionId)
+    if (declared === undefined) return ceiling
+    if (ceiling === undefined) return declared
+    return Math.min(declared, ceiling)
+  }
+  function messageTokens(text) {
+    if (!text) return 0
+    try {
+      const n = meter()?.estimateMessage?.({ role: 'user', content: [{ type: 'text', text }] })
+      if (typeof n === 'number' && Number.isFinite(n) && n > 0) return n
+    } catch {}
+    return charsToTokens(text.length)
+  }
+  /** 一侧会话的上下文水位：tokens/window/source/limit/remaining/room/over。 */
+  function pressureOf(sessionId) {
+    const unknown = { tokens: undefined, window: undefined, source: 'none', limit: limitFor(), remaining: 0, room: 0, over: false }
+    if (!sessionId) return unknown
+    let session
+    try { session = ctx.sessions.get(sessionId) } catch { return unknown }
+    if (session === undefined) return unknown
+    let cp = {}
+    try { cp = meter()?.contextPressure?.(session) ?? {} } catch { cp = {} }
+    let measured
+    try { measured = meter()?.measure?.(session) } catch { measured = undefined }
+    const declaredWindow = typeof cp.contextWindow === 'number' && cp.contextWindow > 0 ? cp.contextWindow : undefined
+    const window = windowOf(sessionId, declaredWindow)
+    const provider = typeof cp.pressureTokens === 'number' ? cp.pressureTokens : undefined
+    const projected = typeof cp.projectedTokens === 'number' ? cp.projectedTokens : undefined
+    const measuredTotal = typeof measured?.totalTokens === 'number' ? measured.totalTokens : undefined
+    // 权威读数优先：provider 报的 / 下一拍投影 / measure() 的重定价总量。measure() 在 provider
+    // 不报 usage 时会给 estimated 基线，并且尊重压缩后的 surface —— 这是它优于字数估算之处。
+    // 三者全都拿不到才退回事件流字数估算：扫原始事件会把已被压缩掉的旧 span 也算进去，
+    // 长期会话会高估，所以它只当最后防线，不参与取最大值。
+    const guess = surfaceEstimate(session)
+    const authoritative = [provider, projected, measuredTotal].filter((n) => typeof n === 'number' && Number.isFinite(n))
+    if (authoritative.length === 0) {
+      if (!(guess > 0)) return { ...unknown, window, limit: limitFor(window) }
+      const limit0 = limitFor(window)
+      return { tokens: guess, window, source: 'heuristic', limit: limit0, baselineKind: measured?.baseline?.kind ?? null, remaining: Math.max(0, limit0 - guess), room: Math.max(0, Math.floor((limit0 - guess) * config.contextSafetyRatio)), over: guess >= limit0 }
+    }
+    const tokens = Math.max(...authoritative)
+    const source = tokens === measuredTotal ? 'measured'
+      : tokens === projected ? 'projected'
+      : tokens === provider ? 'provider' : 'measured'
+    const limit = limitFor(window)
+    return {
+      tokens, window, source, limit, declaredWindow, ceiling: ceilingOf(sessionId) ?? null,
+      baselineKind: measured?.baseline?.kind ?? null,
+      heuristicTokens: guess,
+      remaining: Math.max(0, limit - tokens),
+      room: Math.max(0, Math.floor((limit - tokens) * config.contextSafetyRatio)),
+      over: tokens >= limit,
+    }
+  }
+  /** 阈值跟随真实窗口：窗口 − 预留量 与配置上限取小；小窗口下再兜一半的下限。
+   *  v1.2.4：`contextSplitTokens` 一旦设置（512K/1M 这类客户设定），它就是那个「配置上限」，
+   *  但仍然不许超过「窗口 − 预留量」——否则永远到不了阈值，分段一次都不会触发。 */
+  function limitFor(window) {
+    const cap = config.contextSplitTokens > 0 ? config.contextSplitTokens : config.maxContextTokens
+    if (typeof window !== 'number' || window <= 0) return cap
+    const floor = Math.min(config.minContextTokens, Math.max(1000, Math.floor(window * 0.5)))
+    const capped = Math.max(floor, window - config.contextReserveTokens)
+    return Math.max(1000, Math.min(cap, capped))
+  }
+  const pressureText = (p) => `≈${kTokens(p.tokens)}（${p.source}${p.window ? `/窗 ${kTokens(p.window)}` : ''}/线 ${kTokens(p.limit)}）`
+  /** 建对时提醒客户：本地模型单通道，别的会话还在跑就会互相拖慢。 */
+  const channelAdvice = (pair) => {
+    const others = channelOthers(pair)
+    if (others.length === 0) return '\n模型通道：当前没有其他会话在跑，串行无冲突。'
+    return `\n模型通道：现在还有 ${others.length} 个别的会话在跑（${others.slice(0, 3).join(', ')}…）——本地模型单通道，它们跑着时插件不会插队（投递会排队/延后），要快就先把无关会话停掉。`
+  }
+  /** 角色卡/评审头一行给会话看的水位描述（水位测不出时给出明确原因，不假装正常）。 */
+  const sidePressureLine = (pair, role) => {
+    const p = pressureOf(role === 'worker' ? pair.workerId : pair.supervisorId)
+    return p.tokens === undefined
+      ? `水位未知（会话未载入或无读数），接力阈值 ${kTokens(p.limit)}`
+      : `水位 ${kTokens(p.tokens)}（读数来源 ${p.source}），接力阈值 ${kTokens(p.limit)}${p.window ? `，窗口 ${kTokens(p.window)}` : ''}`
+  }
+
+  /** 中间裁掉、首尾保留：评审/交接材料最有用的是开头结论与最近现场。 */
+  function capMiddle(text, maxChars, label) {
+    const s = typeof text === 'string' ? text : text == null ? '' : String(text)
+    if (s.length <= maxChars) return s
+    const mark = `\n…〔${label ?? '内容'}按上下文预算裁掉 ${s.length - maxChars} 字，原 ${s.length} 字；全文可用 supervision_worker_log / supervision_reports 取〕…\n`
+    const head = Math.max(200, Math.floor((maxChars - mark.length) * 0.65))
+    const tail = Math.max(0, maxChars - mark.length - head)
+    return s.slice(0, head) + mark + (tail > 0 ? s.slice(s.length - tail) : '')
+  }
+  /**
+   * 投递闸门：插件塞进会话的每一条消息都先量一遍，装不下就裁到剩余额度内。
+   * 单这一条就能杜绝「一次送审把会话顶爆」；水位未知时只做硬上限，不做比例裁剪。
+   */
+  function fitDelivery(pair, sessionId, tag, text) {
+    let out = capMiddle(text, config.deliverMaxChars, `投递 ${tag}`)
+    const p = pressureOf(sessionId)
+    if (p.tokens === undefined || messageTokens(out) <= p.room) return out
+    const targetChars = Math.max(900, Math.floor(p.room * 3))
+    if (out.length > targetChars) {
+      const before = out.length
+      out = capMiddle(out, targetChars, `${tag}(上下文预算 ${kTokens(p.tokens)}/${kTokens(p.limit)})`)
+      warn(`delivery ${tag} shrunk ${before}->${out.length} chars for ${sessionId} ${pressureText(p)}`)
+      if (pair) recordReport('delivery-trim', pair, { tag, sessionId, from: before, to: out.length, tokens: p.tokens, limit: p.limit, source: p.source, window: p.window ?? null })
+    }
+    return out
   }
 
   async function workerEvents(pair) {
@@ -423,33 +653,229 @@ export function apply(ctx, rawConfig = {}) {
   // ---------------------------------------------------------------- serial gate
 
   let serialTail = Promise.resolve()
+  let watchdogAt = 0
+  /** 全宿主活跃会话（sessionId -> since）。本地模型单通道：同时只允许一个在跑。 */
+  const liveAgents = new Map()
+  let channelSource = 'events'
 
-  const pairIdle = (pair) => pair.workerRunning === false && pair.supervisorRunning === false
+  // v3.4：只有【明确在跑】才算忙。旧口径 `=== false` 把「运行位还没被 agent/status 更新过」
+  // （undefined：新建对的第一拍、插件重载/hydrate 复原的对）当成忙 —— 结果每一条投递都被
+  // 判成 not-idle 入队，而队列排空的判据同样是「不在 idle」，永远排不空 ——
+  // 客户看到的就是「会话监督不起作用」（11-16 实测：sup-1-95j9s 投递全被 gate=channel-busy/not-idle 停投）。
+  const pairIdle = (pair) => pair.workerRunning !== true && pair.supervisorRunning !== true
 
-  async function waitPairIdle(pair) {
-    const deadline = Date.now() + config.serialWaitMs
+  /**
+   * 等这一对完全空闲。超时后默认「放弃这次投递」而不是硬塞：worker 单轮可能连着跑
+   * 很久（实测 2.5 小时 / 61 步的取证轮），硬塞会在轮中途 splice inbox 打断它，
+   * 客户看到的就是「跑到一半被打断/白跑」。放弃的投递由看门狗在空闲点重投。
+   */
+  async function waitPairIdle(pair, opts = {}) {
+    const deadline = Date.now() + (opts.waitMs ?? config.serialWaitMs)
     while (!pairIdle(pair)) {
       if (pair.state === 'stopped') return false
       if (Date.now() > deadline) {
-        warn(`serial gate timed out (${pair.id}); delivering anyway (worker=${pair.workerRunning}, supervisor=${pair.supervisorRunning})`)
-        return true
+        warn(`serial gate timed out (${pair.id}); ${opts.defer ? 'deferring delivery' : 'delivering anyway'} (worker=${pair.workerRunning}, supervisor=${pair.supervisorRunning})`)
+        return opts.defer ? false : true
       }
       await sleep(2000)
     }
     return true
   }
 
+  /**
+   * 本对以外正在占用模型通道的会话（本地模型单通道，它们跑着时插件不许插队）。
+   * 只认「最近真的在动」的会话：running 挂着但 updatedAt 早于 channelStaleMs 的算僵尸条目，
+   * 否则一个卡住的会话就能把监督永久饿死（v3.2 实测踩过）。
+   */
+  const channelOthers = (pair, now = Date.now()) => [...liveAgents.entries()]
+    .filter(([id, entry]) => id !== pair.workerId && id !== pair.supervisorId
+      && (typeof entry !== 'object' || !entry.updatedAt || now - entry.updatedAt <= config.channelStaleMs))
+    .map(([id]) => id)
+  /**
+   * 用宿主 session/list 校正通道账本：agent/status 事件只覆盖「插件加载之后」的状态，
+   * 重载时已经在跑的会话不会重放事件 —— 那会让闸门误判成「通道空闲」。
+   * 真实宿主可按 running 字段重建；桩/异常（拿不到清单）时保留事件账本不动。
+   */
+  async function syncChannelRoster() {
+    let value
+    try { value = await ctx.sessionController.list?.({}, AbortSignal.timeout(10000)) } catch { return }
+    const items = value?.items ?? value?.sessions
+    if (!Array.isArray(items) || items.length === 0) return
+    const now = Date.now()
+    const next = new Map()
+    const seen = new Set()
+    for (const row of items) {
+      const id = row?.sessionId ?? row?.id
+      if (!id) continue
+      seen.add(id)
+      if (row?.running === true) {
+        const previous = liveAgents.get(id)
+        const updated = typeof row.updatedAt === 'number' ? row.updatedAt : now
+        next.set(id, { since: previous?.since ?? updated, updatedAt: updated, seenAt: now })
+      }
+    }
+    // 事件刚入账、清单还没反映的（30s 内）保留
+    for (const [id, entry] of liveAgents) if (!seen.has(id) && now - (entry?.seenAt ?? now) < 30000) next.set(id, entry)
+    liveAgents.clear()
+    for (const [id, entry] of next) liveAgents.set(id, entry)
+    channelSource = 'list'
+  }
+  /**
+   * 排队（v3.3）：同一 (tag, sessionId) 只留最新一份文本，但保持先来后到的位置，
+   * 这样角色卡/评审/整改指令不会因为「通道一直忙」而被静默丢掉 —— 丢卡就是「监督不起作用」。
+   */
+  function parkDelivery(pair, tag, sessionId, text, gate, extra = {}, hint = {}) {
+    const queue = pair.pendingDeliveries ?? (pair.pendingDeliveries = [])
+    const existing = queue.findIndex((row) => row.tag === tag && row.sessionId === sessionId)
+    // hint.since：从队列里取出来又被重新排队的条目，必须保留原始排队时刻，
+    // 否则「饿死计时」每轮重置 → channelMaxWaitMs 强行放行永远触发不了。
+    const since = hint.since ?? Date.now()
+    const tries = hint.tries ?? 0
+    const previousGate = existing >= 0 ? queue[existing].gate : null
+    const row = { tag, sessionId, text, since: existing >= 0 ? queue[existing].since : since, tries: existing >= 0 ? (queue[existing].tries ?? 0) + 1 : tries, gate }
+    if (existing >= 0) queue[existing] = row
+    else queue.push(row)
+    while (queue.length > config.pendingDeliveryMax) queue.splice(0, queue.length - config.pendingDeliveryMax)
+    // 只在「首次入队」或「闸门换了」时记 journal + 日志：补发节拍每 2.5s 重来一次的话，
+    // 同一条卡住的材料会把 journal 刷成几百条，还会拖慢同步落盘（实测把回归测试拖到 60s+）。
+    if (existing < 0 || previousGate !== gate) {
+      recordReport('delivery-deferred', pair, { tag, sessionId, gate, queued: queue.length, tries: row.tries, ...extra })
+      warn(`${tag} delivery parked (${pair.id}); gate=${gate} queued=${queue.length}`)
+    }
+    // 排队后自己挂补发节拍：看门狗 15~20s 才扫一遍，不能让客户等这么久（更靠不住的是它没扫到）。
+    armDrain(pair, config.drainRetryMs)
+  }
+  /** 每个对只挂一个补发定时器（合并重复），到点排空队列。 */
+  function armDrain(pair, delayMs) {
+    const waitMs = Math.max(delayMs, 50)
+    if (pair.drainAt > Date.now()) return
+    pair.drainAt = Date.now() + waitMs
+    schedule(() => {
+      pair.drainAt = 0
+      if (pair.state !== 'active') { pair.pendingDeliveries = []; return }
+      drainPendingDeliveries(pair, Date.now())
+    }, waitMs)
+  }
+  /**
+   * 有人在看着（面板轮询 / supervision_status 查询）：把压着的待投队列立刻重试一次。
+   * 后台节拍（drainRetryMs）负责自动补发；客户手动查状态的这一刻不该还得等下一拍才动。
+   */
+  function nudgeQueuedDrains() {
+    for (const p of pairs.values()) if ((p.pendingDeliveries ?? []).length > 0) armDrain(p, 0)
+  }
+  /** 看门狗排空队列：通道 + 这一对都空才发；饿太久就强行放行（宿主本来会自己排队）。 */
+  function drainPendingDeliveries(pair, now) {
+    const queue = pair.pendingDeliveries
+    if (!queue || queue.length === 0) return
+    if (pair.state !== 'active') { pair.pendingDeliveries = []; return }
+    // 抖动闸门：状态轮询 / 空闲事件都会催补发，200ms 内只真正试一次，别把链与 journal 刷爆
+    if (now - (pair.lastDrainAt ?? 0) < 200) { armDrain(pair, 220); return }
+    pair.lastDrainAt = now
+    const row = queue.find((item) => !item.inFlight)
+    if (!row) return
+    const starved = now - row.since > config.channelMaxWaitMs
+    if (!starved && (!pairIdle(pair) || channelOthers(pair, now).length > 0)) { armDrain(pair, config.drainRetryMs); return }
+    if (starved) warn(`forcing parked ${row.tag} delivery (${pair.id}) after ${Math.round((now - row.since) / 1000)}s of channel contention`)
+    // v3.4.1：原地重试 —— 条目【留在队列里】只打 inFlight 标记，投成功了才摘掉。
+    // 旧写法先 shift 再投：闸门一变忙就 parkDelivery 重新 push（existing<0）→ 于是
+    // ① 每次重试都算「首次入队」→ journal 每 2.5s 刷一条 delivery-deferred（真机实测刷了 30+ 条）；
+    // ② since/tries 被重置 → 饿死计时与 tries 计数全废。
+    row.inFlight = true
+    serialDeliver(pair, row.tag, row.sessionId, row.text, { fromQueue: true, forced: starved, queueRow: row })
+      .then((requestId) => {
+        row.inFlight = false
+        if (!requestId) return
+        const index = (pair.pendingDeliveries ?? []).indexOf(row)
+        if (index >= 0) pair.pendingDeliveries.splice(index, 1)
+      })
+      .catch((error) => { row.inFlight = false; warn('queued delivery failed', error) })
+  }
+
   /** The turnstile: one plugin delivery at a time, pair fully idle, never concurrent model use. */
-  function serialDeliver(pair, tag, sessionId, text) {
+  function serialDeliver(pair, tag, sessionId, text, opts = {}) {
+    // v3.1 投递前水位闸门。这段必须留在串行链【外面】：链内 await 接力会自锁
+    // （接力自己也要经这条链投递交接卡），实测症状就是投递永不落地。
+    // 接力是异步换会话；下面的 run 只负责把料改发给届时的活体会话。
+    const side = pair.workerId === sessionId ? "worker" : pair.supervisorId === sessionId ? "supervisor" : null
+    if (side && pair.state === "active") {
+      const wall = pressureOf(sessionId)
+      if (wall.over) {
+        warn(`${tag} -> ${sessionId} hit pressure wall (${pair.id} ${side} ${pressureText(wall)}); relaying first`)
+        recordReport("pressure-wall", pair, { tag, role: side, sessionId, tokens: wall.tokens ?? null, limit: wall.limit, window: wall.window ?? null, source: wall.source })
+        pushError(pair, `${side === "worker" ? "执行" : "监督"}侧投递 ${tag} 前撞上水位 ${pressureText(wall)}，先接力再投递（绝不往快爆的会话里塞料）`)
+        handoverIfNeeded(pair, side, { reason: `投递 ${tag} 前${side === "worker" ? "执行" : "监督"}侧${pressureText(wall)}已过阈值` })
+          .catch((error) => warn("pre-delivery rollover failed", error))
+      }
+    }
     const run = async () => {
       if (pair.state === 'stopped' && tag !== 'notice') return
+      // 接力可能已经把本侧换到新会话：改发届时的活体会话，避免投给退休会话被 deliveryBlocker 丢掉
+      const target = side ? (side === "worker" ? pair.workerId : pair.supervisorId) : sessionId
       // v3 投递前一致性检查：会话已被接力退休 / 已不属于本对（重复对）时不再投递，
       // 避免旧会话被唤醒 —— 这是「老会话停止运行」的硬保证。
-      const why = deliveryBlocker(pair, sessionId, tag)
-      if (why) { warn(`skip ${tag} delivery -> ${sessionId} (${why})`); return }
-      const ok = await waitPairIdle(pair)
-      if (!ok) return undefined
-      const requestId = await deliver(sessionId, tag, text)
+      const why = deliveryBlocker(pair, target, tag)
+      if (why) {
+        warn(`skip ${tag} delivery -> ${target} (${why})`)
+        // v1.2.4 真正的死锁源：队列里指向【已退休/已换掉】会话的条目，重试永远只会被 blocker 挡回。
+        // 不把它从队列摘掉，FIFO 头就永久堵住，后面所有分段卡/角色卡都发不出去（实测：第 2 段卡被
+        // 一个发给旧会话的 worker-card 堵死）。这里按「丢弃并出队」处理，并留 audit。
+        if (opts.queueRow) {
+          const index = (pair.pendingDeliveries ?? []).indexOf(opts.queueRow)
+          if (index >= 0) pair.pendingDeliveries.splice(index, 1)
+          recordReport('delivery-dropped', pair, { tag, sessionId: target, reason: why, queued: (pair.pendingDeliveries ?? []).length })
+        }
+        return
+      }
+      const queue = pair.pendingDeliveries ?? (pair.pendingDeliveries = [])
+      // v3.3 先来后到：队里还有更早的料没投出去，这条也只能入库排队（保持顺序，角色卡不被 notice 抢跑）。
+      // 关键变化：闸门只给短暂宽限，等不到就【入库并立刻返回】，绝不把全局串行链按住 ——
+      // 旧版死等 deferAfterMs(2min)：19 个对每来一条就占链 2 分钟，整条链被吃死；
+      // 而旧版单槽 deferredDelivery 还会被后来的 notice 覆盖，【角色卡直接丢失】
+      // （监督会话拿不到角色卡 → 永远不调 supervision_verdict → 超时熔断 → 「监督不起作用」）。
+      const starvedMs = queue.length > 0 ? Date.now() - queue[0].since : 0
+      const starved = starvedMs > config.channelMaxWaitMs
+      if (!opts.fromQueue && queue.length > 0) {
+        if (!starved) { parkDelivery(pair, tag, target, text, 'queue-ahead', { ahead: queue.map((row) => row.tag) }, opts.hint); return undefined }
+        // 队列头饿得太久：先把它强行投出去（当前这条继续排队），监督不能永远不动
+        const head = queue.shift()
+        recordReport('delivery-forced', pair, { tag: head.tag, sessionId: head.sessionId, waitedMs: starvedMs, others: channelOthers(pair).length })
+        warn(`forcing queued ${head.tag} delivery (${pair.id}) after ${Math.round(starvedMs / 1000)}s`)
+        serialDeliver(pair, head.tag, head.sessionId, head.text, { fromQueue: true, forced: true, hint: { since: head.since, tries: head.tries } }).catch((error) => warn('forced delivery failed', error))
+        parkDelivery(pair, tag, target, text, 'queue-ahead', { ahead: ['<forced>'] }, opts.hint)
+        return undefined
+      }
+      // v3.4 空闲闸门：同步判定，绝不在这条全局串行链里 await。
+      const ok = pairIdle(pair)
+      if (!ok) { parkDelivery(pair, tag, target, text, 'not-idle', {}, opts.hint); return undefined }
+      // v3.4 全局单通道闸门：本地模型只有一个推理通道，别的会话在跑时插件绝不插队。
+      // 判定改为【同步、立刻】：旧版在这里 await waitChannelFree(grace) —— 闸门把全局串行链
+      // 按住 20s/条，19 个对一拥上来整条链就死了（客户看到「会话监督不起作用」）。
+      if (config.channelGuard && !opts.forced) {
+        const others = channelOthers(pair)
+        if (others.length > 0) {
+          pair.deferredByChannel = (pair.deferredByChannel ?? 0) + 1
+          parkDelivery(pair, tag, target, text, 'channel-busy', { others: others.slice(0, 4), othersCount: others.length })
+          return undefined
+        }
+      } else if (config.channelGuard && opts.forced) {
+        const others = channelOthers(pair)
+        if (others.length > 0) warn(`forcing ${tag} delivery (${pair.id}) despite ${others.length} other session(s) on the channel`)
+      }
+      const requestId = await deliver(target, tag, fitDelivery(pair, target, tag, text))
+      // 排队材料的补发流水在【真送达】这一刻记。旧写法在取出时就记：一取出算一次「补发」，
+      // 随后又被闸门退回队列 → 每 2.5s 刷一条 delivery-retry/deferred，journal 被刷爆（真机实测 30+ 条）。
+      if (opts.queueRow) {
+        recordReport(opts.forced ? 'delivery-forced' : 'delivery-retry', pair, {
+          tag, sessionId: target, waitedMs: Date.now() - (opts.queueRow.since ?? Date.now()),
+          tries: opts.queueRow.tries ?? 0, forced: !!opts.forced,
+        })
+      }
+      // 评审材料落地的这一刻才起算评审时限（排队/通道等待的时间不计）
+      if (tag === 'review') { pair.lastSupervisorHand = Date.now(); pair.reviewParkAt = 0 }
+      // 入队投递的 requestId 只能在真送达时才知道（.then 里那次可能是「入队」而不是「送达」）
+      if (tag === 'fix') pair.fixRequestId = requestId
+      // 队里还有货：立刻接着投（别等下一个 2.5s 节拍），保持排队后进先出也准时。
+      if ((pair.pendingDeliveries ?? []).length > 0) armDrain(pair, 300)
       await sleep(1500)
       return requestId
     }
@@ -493,7 +919,8 @@ export function apply(ctx, rawConfig = {}) {
     `2. 只有当客户需求【全部】做完并实际验证后，调用一次 supervision_done（附完成摘要与真实命令输出证据）；插件会串行排队通知监督评审，之后你保持空闲等待结论。`,
     `3. 监督判定 needs_fix 时，插件会自动把修复指令发回本会话；修完验证完再调用一次 supervision_done（最多 ${config.maxFixRounds} 轮，超限自动熔断等待人工）。`,
     `4. 禁止调用 supervision_start / supervision_enroll 制造新监督对；你的任务归本监督对管辖。`,
-    `5. 上下文约定：模型上限约 254k，达到 ${kTokens(config.maxContextTokens)} 插件会自动把你接力到新的执行会话（交接卡自包含，本会话同时停止运行），你无需整理上下文；本监督对始终只有你一个活体执行会话，监督会话也只有一个。`,
+    `5. 上下文约定：本执行会话${sidePressureLine(pair, 'worker')}，达线插件自动把你接力到新的执行会话（交接卡自包含，本会话同时停止运行），你无需整理上下文；若 provider 先拒了请求（上下文溢出），插件会立刻紧急接力，任务不会丢。本监督对始终只有你一个活体执行会话，监督会话也只有一个。`,
+    `5b. 省力约定：不要把大段日志/文件原文贴进回复（工具输出本身已在会话上下文里，再贴一遍等于双倍烧）；引用请写路径 + 关键行。`,
     `6. 【禁止假完成】supervision_done 之前必须自己先跑一遍验收（读文件/跑命令/请求 API/开页面），摘要里贴真实输出；做不到的项直接写明「未做+原因」，谎报会被监督逐项复核驳回并进入整改轮。`,
     `7. 【必须上报】本轮任务做完但不调 supervision_done，监督永远不会启动：插件会在你空闲 ${Math.round(config.idleNudgeMs / 1000)}s 后提醒你上报，${Math.round(config.idleForceReviewMs / 1000)}s 内仍不上报就强制送监督评审（届时你的工作会被判为「未自证完成」）。`,
     pair.auto
@@ -507,13 +934,14 @@ export function apply(ctx, rawConfig = {}) {
     `执行会话 sessionId：${pair.workerId}`,
     '评审时机（重要）：执行会话【全部完成】并调用 supervision_done 后，插件才会把评审材料发来；中间步骤不会触发评审，你也不要在等待期间反复查询。',
     `串行约定：本地模型一次只跑一个会话。你给出结论（调用 supervision_verdict）并结束本轮后，插件才会把整改指令串行发回执行会话。`,
-    '客户原始需求：\n' + pair.requirement,
+    '客户原始需求：\n' + capMiddle(pair.requirement, config.requirementMaxChars, '原始需求'),
     '评审协议：',
     '1. 收到 [监督评审] 消息时，结合内嵌的执行日志摘录判断完成情况；需要更多上下文用 supervision_worker_log。',
     '2. 评审对象必须是【交付物本身与运行时证据】，不是执行会话的自述：验收清单逐项由你亲自复现（读文件、跑命令、请求 API、查注册）；凡日志里说成功而你无法复核、或复核不过的，一律 needs_fix。',
     '3. 评审材料里的【硬故障证据】（浏览器上报错误/客户直接反馈）是无条件 bug：只要存在未解决记录，禁止 complete。',
     '4. 【反假完成·硬门槛】supervision_verdict 必须带 checklist：把需求/验收清单拆成条目，每条给你【亲自执行过的】核验命令或路径与核验结果（verified: done/failed/unverified + evidence）。',
-    '   - 证据必须是你自己跑出来的（命令输出、文件真实内容与行数、HTTP 状态码、页面截图路径），不是执行会话的原话；照抄对方摘要 = 该条未核验。',
+     '   - 证据必须是你自己跑出来的（命令输出、文件真实内容与行数、HTTP 状态码、页面截图路径），不是执行会话的原话；照抄对方摘要 = 该条未核验。',
+    `   - 【长度纪律】每条 evidence ≤ 200 字：写「命令 + 最关键的一行输出」，不要贴整段日志/整个文件/整个 diff；summary ≤ ${config.fixSummaryMaxChars} 字。监督会话的上下文比执行会话更容易炸，一炸整对就停摆（插件会裁掉超长内容，但请你本来就写短）。`,
     `   - 插件会校验：complete 时缺 checklist、有条目未核验或没有证据、summary 少于 ${config.completeSummaryMinChars} 字、上一轮整改项没有对应结论 —— 都会被直接打回，本轮评审作废。`,
     '5. 每条核验要么 done 附证据，要么 failed/unverified 并写清怎么复现的失败；只要有一条不是 done，结论只能是 needs_fix。',
     '6. 每轮评审必须调用一次 supervision_verdict 收尾，这是你的唯一结论渠道：',
@@ -527,20 +955,107 @@ export function apply(ctx, rawConfig = {}) {
       : '',
   ].filter(Boolean).join('\n')
 
-  const handoverCard = (pair, side, summaryText) => [
-    `【接力交接】监督对 ${pair.id}「${pair.name}」。因${side === 'worker' ? '执行' : '监督'}会话上下文达到 ${kTokens(config.maxContextTokens)} 上限，插件开启本会话接替上一${side === 'worker' ? '执行' : '监督'}会话（旧会话改名「已接力」保留追溯，其内容不必读取，以下材料已自包含）。`,
+  const handoverCard = (pair, side, summaryText, opts = {}) => [
+    `【接力交接】监督对 ${pair.id}「${pair.name}」。${opts.reason ?? '上下文水位到达接力阈值'}，插件开启本会话接替上一${side === 'worker' ? '执行' : '监督'}会话（旧会话改名「已接力」保留追溯，其内容不必读取，以下材料已自包含）。`,
+    opts.pressure ? `旧会话交接时水位：${pressureText(opts.pressure)}（这就是插件判断「该换会话」的依据）。` : '',
     '串行约定：本地模型一次只跑一个会话，插件按队列自动协调双方，你只需完成自己这一轮并正常结束。',
     side === 'worker'
       ? '你的职责：继续完成客户需求。先核对现场文件再动手，避免重做已完成部分；全部完成并验证后调用 supervision_done（附真实输出证据）；不上报监督永远不会启动。禁止调用 supervision_start / supervision_enroll。'
       : '你的职责：接替监督评审。只评审不执行；只有执行会话全部完成（supervision_done）后插件才会送评审材料，每轮评审必须以 supervision_verdict（带逐项 checklist 与亲自核验证据）收尾。禁止调用 supervision_start / supervision_enroll / supervision_done。',
     '——— 交接材料 ———',
-    `原始需求：\n${pair.requirement}`,
+    `原始需求：\n${capMiddle(pair.requirement, config.requirementMaxChars, '原始需求')}`,
     `对账状态：已评审 ${pair.reviews} 轮，自动修复 ${pair.fixRounds}/${config.maxFixRounds} 轮，上一次结论 ${pair.lastVerdict ?? '（无）'}${pair.lastSummary ? `\n上次结论摘要：${snippet(pair.lastSummary, 1200)}` : ''}`,
     side === 'worker' && pair.lastDoneSummary ? `上次完成上报摘要：${snippet(pair.lastDoneSummary, 800)}` : '',
     side === 'worker' ? `工作目录：${pair.cwd ?? '（默认）'}` : `执行会话 sessionId：${pair.workerId}`,
     '——— 最近执行日志摘录 ———',
     summaryText,
-  ].join('\n')
+  ].filter(Boolean).join('\n')
+
+  // ------------------------------------------------------ context split (1.2.4)
+  // 客户要求：上下文超过【客户设置的窗口大小】（512K / 1M）时，自动把超出的部分拆成
+  // 有序分段，按顺序逐段完成（每段一个新执行会话，绝不硬撑一个会话）。
+  const splitItemLine = (text) => String(text ?? '').replace(/^\s*(?:[-*·]|\d+[.)、])\s*/, '').trim()
+
+  /** 把「还没做完的活」按优先级收成有序条目：整改项 → 核验缺口 → 验收清单 → 整段需求。 */
+  function splitItems(pair) {
+    const items = []
+    const push = (text, source) => { const line = splitItemLine(text); if (line) items.push({ text: line, source }) }
+    if (pair.lastVerdict === 'needs_fix') {
+      for (const line of String(pair.lastFixInstructions ?? '').split(/\r?\n/)) if (line.trim()) push(line, 'fix')
+    }
+    for (const row of checklistRows(pair.lastChecklist)) {
+      if (String(row?.verified ?? '') !== 'done') push(`${row?.item ?? ''}（证据缺口：${snippet(row?.evidence ?? '未提供', 160)}）`, 'checklist')
+    }
+    if (items.length === 0) {
+      const source = pair.currentRequirement || pair.requirement || ''
+      const lines = String(source).split(/\r?\n/).map((line) => splitItemLine(line)).filter(Boolean)
+      for (const line of lines) push(line, 'requirement')
+    }
+    if (items.length === 0) push(`完成需求：${snippet(pair.requirement ?? '（需求为空）', 400)}`, 'requirement')
+    return items
+  }
+
+  /** 每段的字数预算：按客户设定的大小折算（≈2.4 字/token，留出卡头/证据/回复的余量）。 */
+  function splitBudget(tokens) {
+    if (config.contextSplitPartChars > 0) return config.contextSplitPartChars
+    const capacity = (tokens ?? config.contextSplitTokens) || config.maxContextTokens
+    return Math.max(600, Math.floor(capacity * 2.4))
+  }
+
+  /** 阈值展示：小于 1k 别显示成「0k」（dry-run 传 400 这种小预算时会出现）。 */
+  const tokenLabel = (n) => (typeof n === 'number' && n > 0 && n < 1000 ? `${n} tok` : kTokens(n))
+
+  /** 生成分段计划（纯函数，dry-run 也用它）：parts[0] 是第 1 段。 */
+  function planSplit(pair, pressure, tokenBudget) {
+    const items = splitItems(pair)
+    const limit = tokenBudget ?? (config.contextSplitTokens || limitFor(pressure?.window))
+    const budget = splitBudget(limit)
+    const parts = []
+    let current = []
+    let size = 0
+    for (const item of items) {
+      const cost = item.text.length + 24
+      if (current.length > 0 && size + cost > budget) { parts.push(current); current = []; size = 0 }
+      current.push(item); size += cost
+    }
+    if (current.length) parts.push(current)
+    // 段数封顶：太碎反而更慢，尾部并成最后一段（宁少不多）
+    if (parts.length > config.contextSplitMaxParts) {
+      const head = parts.slice(0, config.contextSplitMaxParts - 1)
+      const tail = parts.slice(config.contextSplitMaxParts - 1).flat()
+      head.push(tail)
+      return { parts: head, items, budget, limit, tokens: pressure?.tokens ?? null, index: 1, planAt: Date.now() }
+    }
+    return { parts, items, budget, limit, tokens: pressure?.tokens ?? null, index: 1, planAt: Date.now() }
+  }
+
+  /** 第 k/N 段的自包含卡片：本段只做这几项，前段结果不重做，做完立刻上报。 */
+  function splitCard(pair, plan, partIndex, opts = {}) {
+    const part = plan.parts[partIndex - 1] ?? []
+    const total = plan.parts.length
+    const done = plan.parts.slice(0, partIndex - 1).flat()
+    return [
+      `【分段接力 · 第 ${partIndex}/${total} 段】监督对 ${pair.id}「${pair.name}」：上一段会话已到上下文上限（${opts.reason ?? '超过客户设置的窗口大小'}），插件把剩余的活拆成 ${total} 段按顺序做，本会话只做第 ${partIndex} 段。`,
+      opts.pressure ? `旧会话交接时水位：${pressureText(opts.pressure)}（分段阈值 ${tokenLabel(plan.limit)}）。` : '',
+      `原始需求（自包含，不必去读旧会话）：\n${capMiddle(pair.requirement, config.requirementMaxChars, '原始需求')}`,
+      done.length ? `前面 ${partIndex - 1} 段已完成，不要重做：\n${done.map((item) => `- ${snippet(item.text, 200)}`).join('\n')}` : '',
+      `【本段只做这 ${part.length} 项（按顺序做，逐项自证）】\n${part.map((item, i) => `${i + 1}. ${snippet(item.text, 600)}`).join('\n')}`,
+      partIndex < total
+        ? `本段做完立刻调用 supervision_done（摘要写清本段做了什么 + 真实命令输出）。插件会把第 ${partIndex + 1}/${total} 段发到新会话继续；不要提前做后面的段，也不要重做前面的段。`
+        : '这是最后一段。做完并自证后调用 supervision_done，插件随即送监督评审。',
+      `工作目录：${pair.cwd ?? '（默认）'}；禁止调用 supervision_start / supervision_enroll。`,
+      '串行约定：本地模型一次只跑一个会话，你只需完成本段并正常结束。',
+    ].filter(Boolean).join('\n')
+  }
+
+  /** 段与段之间的推进：本段上报 → 起新会话投下一段（间隔给上一段收尾，不让两段抢通道）。 */
+  function scheduleSplitPart(pair, delay = 800) {
+    schedule(() => {
+      if (pair.state !== 'active') return
+      handoverIfNeeded(pair, 'worker', { force: true, split: true, reason: `分段接力（第 ${pair.splitPlan?.index ?? '?'} 段续接）` })
+        .catch((error) => warn('split part dispatch failed', error))
+    }, delay)
+  }
 
   // ---------------------------------------------------------------- rollover
 
@@ -570,16 +1085,18 @@ export function apply(ctx, rawConfig = {}) {
     return stopped
   }
 
-  async function handoverIfNeeded(pair, side) {
+  async function handoverIfNeeded(pair, side, opts = {}) {
     if (pair.state !== "active") return false
     const role = side === "worker" ? "worker" : "supervisor"
     const previousId = role === "worker" ? pair.workerId : pair.supervisorId
-    const tokens = contextTokens(previousId)
-    if (tokens === undefined || tokens < config.maxContextTokens) return false
+    const pressure = pressureOf(previousId)
+    // force：上下文溢出后的紧急接力。provider 已经把这个会话的请求拒了，继续留在旧会话
+    // 里必然什么都做不了（DSH 自带压缩也会撞同一个 400），只能换会话。
+    if (!opts.force && (pressure.tokens === undefined || !pressure.over)) return false
     pair.rolling = pair.rolling ?? new Set()
     if (pair.rolling.has(role)) { warn("handover already in flight (" + pair.id + " " + role + ")"); return false }
     if (pair.handovers >= config.maxHandovers) {
-      halt(pair, "上下文接力次数达到上限（" + config.maxHandovers + " 次），" + (role === "worker" ? "执行" : "监督") + "侧仍超过 " + kTokens(config.maxContextTokens))
+      halt(pair, `上下文接力次数达到上限（${config.maxHandovers} 次），${role === 'worker' ? '执行' : '监督'}侧 ${pressureText(pressure)}仍未回落。请人工清理该会话，或调大 maxContextTokens / contextReserveTokens。`)
       return false
     }
     pair.rolling.add(role)
@@ -604,11 +1121,36 @@ export function apply(ctx, rawConfig = {}) {
         return false
       }
       const previousEvents = role === "worker" ? await workerEvents(pair) : []
-      const tail = digestLinesOf(previousEvents).slice(-40).join("\n")
+      const tail = capMiddle(
+        digestLinesOf(previousEvents).slice(-config.handoverTailLines).join("\n"),
+        Math.floor(config.handoverMaxChars * 0.55),
+        "交接摘录",
+      )
       pair.handovers += 1
+      // v1.2.4 分段：执行侧换会话时，如果客户设了 contextSplitTokens（512K/1M），
+      // 交接卡就不再是「整段活 + 摘录」，而是【第 k/N 段】——只做本段，做完上报换下一段。
+      // 已有计划（段间续接）就沿用它的 index，绝不重新从第 1 段开始。
+      let split = null
+      if (role === 'worker' && config.contextSplitTokens > 0) {
+        split = pair.splitPlan && pair.splitPlan.index <= pair.splitPlan.parts.length ? pair.splitPlan : planSplit(pair, pressure)
+        if (split.parts.length <= 1) split = null            // 只剩一段＝没什么可拆，退回普通接力
+        else pair.splitPlan = split
+      }
+      if (split) {
+        recordReport('context-split', pair, {
+          action: 'part-start', part: split.index, total: split.parts.length,
+          tokens: pressure.tokens ?? null, limit: split.limit, budget: split.budget,
+          reason: opts.reason ?? '超过客户设置的上下文大小',
+          items: split.parts[split.index - 1]?.map((item) => snippet(item.text, 160)) ?? [],
+        })
+      }
       const lineageRow = { side: role, number, previousId, newId, at: Date.now(), stopped: false }
       pair.lineage.push(lineageRow)
-      recordReport("handover", pair, { side: role, number, previousId, newId })
+      recordReport("handover", pair, {
+        side: role, number, previousId, newId,
+        reason: opts.reason ?? "水位达线",
+        tokens: pressure.tokens ?? null, limit: pressure.limit, window: pressure.window ?? null, source: pressure.source,
+      })
       if (role === "worker") {
         byWorker.delete(previousId)
         pair.workerId = newId
@@ -628,12 +1170,19 @@ export function apply(ctx, rawConfig = {}) {
       pair.lastHandoverAt = Date.now()
       if (role === "worker") pair.lastWorkerHandoverAt = pair.lastHandoverAt
       else pair.lastSupervisorHandoverAt = pair.lastHandoverAt
-      const delivered = await serialDeliver(pair, "handover", newId, handoverCard(pair, role, tail || "（无摘录）"))
-      if (!delivered) warn("handover card delivery skipped (" + pair.id + " " + role + ")")
+      const cardText = split
+        ? splitCard(pair, split, split.index, { previousId, pressure, reason: opts.reason ?? '超过客户设置的上下文大小' })
+        : handoverCard(pair, role, tail || "（无摘录）", { reason: opts.reason ?? "上下文水位到达接力阈值", pressure })
+      const delivered = await serialDeliver(pair, "handover", newId, cardText)
+      if (split) warn(`split part ${split.index}/${split.parts.length} dispatched (${pair.id}) -> ${newId}`)
+      if (!delivered) warn("handover card parked (" + pair.id + " " + role + ")；角色卡照样排队")
       // 接力会话同时补送完整角色卡（执行纪律 / 监督评审协议），否则新会话只有一张交接卡，
       // 拿不到「只能调 supervision_verdict / 完成后调 supervision_done」这类硬约束。
-      else serialDeliver(pair, role === "worker" ? "worker-card" : "supervisor-card", newId, role === "worker" ? workerCard(pair) : supervisorCard(pair))
-        .then((ok) => { if (!ok) warn("role card after handover skipped (" + pair.id + " " + role + ")") })
+      // v3.4：不再「只有交接卡当场送达才补角色卡」—— 投递现在会入队（返回 undefined 而不是失败），
+      // 旧写法等于把角色卡整个丢掉：新会话只拿到交接卡 → 不知道上报/结论的规矩（实测 T4b 挂死）。
+      // FIFO 队列保证顺序：交接卡先、角色卡后，两条都不许丢。
+      serialDeliver(pair, role === "worker" ? "worker-card" : "supervisor-card", newId, role === "worker" ? workerCard(pair) : supervisorCard(pair))
+        .then((ok) => { if (!ok) warn("role card after handover parked (" + pair.id + " " + role + ")") })
         .catch((error) => warn("role card after handover failed (" + pair.id + " " + role + ")", error))
       warn("handover #" + number + " (" + role + ") " + previousId + " -> " + newId)
       return true
@@ -691,6 +1240,7 @@ export function apply(ctx, rawConfig = {}) {
 
   async function runReview(pair) {
     if (pair.state !== 'active' || !config.reviewEnabled) return
+    warn(`runReview enter (${pair.id}) busy=${pair.busy} timer=${pair.reviewTimerOn}`)
     if (pair.busy) { pair.recheckAfterBusy = true; return }
     if (pair.reviews >= config.maxReviews) {
       halt(pair, `评审轮次达到上限（${config.maxReviews} 轮），自动流程停止。请人工检查执行结果后继续。`)
@@ -706,7 +1256,9 @@ export function apply(ctx, rawConfig = {}) {
     pair.pendingTriggers = []
 
     // Serial: measure / build / hand over only while both sessions are idle.
-    await waitPairIdle(pair)
+    // v3.3：只给短暂宽限（pairIdleGraceMs）；等不到空闲也继续往下走 —— 材料会在
+    // serialDeliver 里入库排队，绝不会打断正在跑的轮，也不会占住任何东西。
+    await waitPairIdle(pair, { defer: true, waitMs: config.pairIdleGraceMs })
     if (pair.state !== 'active') { pair.busy = false; return }
 
     // Digest FIRST from the current worker session, so a rollover never loses
@@ -726,10 +1278,14 @@ export function apply(ctx, rawConfig = {}) {
     pair.phase = 'reviewing'
     const errorNote = pair.recentErrors.length ? `近期错误（仅记录，未评审）：\n${pair.recentErrors.map((line) => `- ${line}`).join('\n')}` : ''
     pair.recentErrors = []
-    const workerTokens = contextTokens(pair.workerId)
-    const supervisorTokens = contextTokens(pair.supervisorId)
+    const workerPressure = pressureOf(pair.workerId)
+    const supervisorPressure = pressureOf(pair.supervisorId)
+    const workerTokens = workerPressure.tokens
+    const supervisorTokens = supervisorPressure.tokens
     pair.lastWorkerTokens = workerTokens
     pair.lastSupervisorTokens = supervisorTokens
+    pair.lastWorkerPressure = workerPressure
+    pair.lastSupervisorPressure = supervisorPressure
     // 未决浏览器错误（UI 崩溃这类日志外的故障由 client 上报回评审回路）
     let errorScanAt = pair.lastErrorScanAt
     const uiErrors = journal.events
@@ -739,27 +1295,29 @@ export function apply(ctx, rawConfig = {}) {
     const uiErrorNote = uiErrors.length
       ? `【硬故障证据·必须处理】未解决的上报错误（浏览器/客户直接反馈，属于必须评审的 bug，逐条在 verdict summary 回应）：\n${uiErrors.map((event) => `- [${new Date(event.at).toLocaleString()}] ${snippet(event.kind === 'user-review' ? event.data?.text : `${event.data?.message} @ ${event.data?.pageUrl || ''}\n${event.data?.stack || ''}`, 500)}`).join('\n')}`
       : ''
+    const acceptanceText = capMiddle(pair.currentRequirement, config.requirementMaxChars, '验收标准')
     const acceptanceNote = pair.requirements.length > 1 || pair.currentRequirement.includes('【验收清单】')
-      ? `验收标准（逐项实际复现核验：文件真实存在/命令输出一致/API 返回正常/页面可打开，跳过任何一项都判 needs_fix）：\n${pair.currentRequirement}`
+      ? `验收标准（逐项实际复现核验：文件真实存在/命令输出一致/API 返回正常/页面可打开，跳过任何一项都判 needs_fix）：\n${acceptanceText}`
       : (pair.auto
-        ? `原始需求（自动纳入监督：请先把它拆成可核验的验收条目，再逐条实际复现——文件真实存在/命令输出一致/API 返回正常/页面可打开；凡是复现不了或复现不过的都判 needs_fix）：\n${pair.currentRequirement}`
+        ? `原始需求（自动纳入监督：请先把它拆成可核验的验收条目，再逐条实际复现——文件真实存在/命令输出一致/API 返回正常/页面可打开；凡是复现不了或复现不过的都判 needs_fix）：\n${acceptanceText}`
         : '')
     const forcedNote = pair.forcedReviewAt
       ? `【强制送审】执行会话空闲后没有调用 supervision_done，插件按现有现场强制送审。请把「没有自证完成」本身当成一条未通过项，逐项复现交付物后给结论；不要接受任何口头完成声明。`
       : ''
     const previousFixNote = pair.lastVerdict === 'needs_fix' && pair.lastFixInstructions
-      ? `【上一条整改 #${pair.lastFixRound ?? pair.fixRounds} 必须复查】\n症状：${snippet(pair.lastFixSummary, 800)}\n要求：${snippet(pair.lastFixInstructions, 1500)}\n上一轮核验记录：\n${checklistText(pair.lastChecklist) || '（无）'}\n本轮 checklist 必须逐条给出这些项的最新结论（item 文案保持一致，插件会据此校验覆盖率）。`
+      ? `【上一条整改 #${pair.lastFixRound ?? pair.fixRounds} 必须复查】\n症状：${snippet(pair.lastFixSummary, 800)}\n要求：${snippet(pair.lastFixInstructions, 1500)}\n上一轮核验记录：\n${capMiddle(checklistText(pair.lastChecklist) || '（无）', config.checklistNoteMaxChars, '上一轮核验记录')}（超出部分是裁掉的旧证据；本轮 checklist 只覆盖验收清单，不要重贴旧证据）\n本轮 checklist 必须逐条给出这些项的最新结论（item 文案保持一致，插件会据此校验覆盖率）。`
       : ''
     const checklistNote = [
       `【逐项核验硬门槛】supervision_verdict 必须带 checklist：每条 = {item, verified: done|failed|unverified, evidence}。`,
       `证据只能来自你自己执行的核验（命令+真实输出片段、文件路径+实际内容、HTTP 状态、截图/日志路径）；照抄执行会话的「已完成」= 该条 unverified。`,
       `complete 的前置条件：${config.completeSummaryMinChars} 字以上的结论 + checklist 全部 done 且都有证据；做不到的项只能 needs_fix（插件会打回不合格结论）。`,
+      `【长度】每条 evidence ≤ 200 字（命令 + 最关键一行输出），summary ≤ ${config.fixSummaryMaxChars} 字；长材料写路径/文件引用，不要整段贴进结论。`,
     ].join('\n')
-    const text = [
+    const text = capMiddle([
       `[监督评审 #${pair.reviews}] 监督对 ${pair.id}「${pair.name}」`,
       `触发：${trigger || '人工触发评审'}`,
       `执行会话当前：${pair.workerRunning ? '运行中' : '空闲'}；累计自动修复 ${pair.fixRounds}/${config.maxFixRounds} 轮；评审预算 ${pair.reviews}/${config.maxReviews}。`,
-      `上下文互审：执行侧 ≈${kTokens(workerTokens)}，监督侧 ≈${kTokens(supervisorTokens)}（上限 ${kTokens(config.maxContextTokens)}，达线自动接力）。${pair.handovers > 0 ? `已接力 ${pair.handovers} 次。` : ''}`,
+      `上下文互审：执行侧 ${sidePressureLine(pair, 'worker')}，监督侧 ${sidePressureLine(pair, 'supervisor')}（${pair.handovers > 0 ? `已接力 ${pair.handovers} 次；` : ''}达阈值即自动接力到新会话，绝不硬撑）。`,
       handoverNote,
       forcedNote,
       acceptanceNote,
@@ -771,15 +1329,34 @@ export function apply(ctx, rawConfig = {}) {
       digest.text || '（无新增记录）',
       '--- 摘录结束 ---',
       `请按角色卡协议评审（先自己跑核验，再下结论），并必须调用 supervision_verdict(pairId="${pair.id}") 给出 complete 或 needs_fix：complete 需要 checklist 逐项 verified=done 且每条附你亲自跑出的证据；needs_fix 必须填写 fixInstructions（逐条对应没过的项）。需要更早历史用 supervision_worker_log(pairId="${pair.id}")。不要自己执行任务，不要创建新监督对。`,
-    ].filter(Boolean).join('\n')
-    pair.lastSupervisorHand = Date.now()
+    ].filter(Boolean).join('\n'), config.reviewMaxChars, '评审材料')
+    // 评审计时起点：等材料【真送达】才开表（下面 serialDeliver 返回 requestId 才算）。
+    // 被排队/通道挡住的分钟绝不该算进「评审轮超时」，否则单通道下一慢就熔断。
+    // 但排队本身也不能无限期吊着本轮（busy=true 会把这对锁死在 reviewing —— v3.4 补的
+    // 「停车超时」兜底：材料停投超过 reviewTurnTimeoutMs 未送达 → 收口 + 计一次超时）。
+    pair.lastSupervisorHand = 0
+    pair.supervisorLastEventAt = 0
     pair.supervisorIdleSince = 0
+    pair.reviewParkAt = Date.now()
     pair.reviewRequestId = await serialDeliver(pair, 'review', pair.supervisorId, text)
-    recordReport('review', pair, { review: pair.reviews, trigger, digestChars: (digest.text || '').length, workerId: pair.workerId, supervisorId: pair.supervisorId, workerTokens: workerTokens ?? null, supervisorTokens: supervisorTokens ?? null })
+    if (pair.reviewRequestId) pair.lastSupervisorHand = Date.now()
+    else warn(`review #${pair.reviews} material parked (${pair.id}); review clock not started; 停车超时 ${Math.round(config.reviewTurnTimeoutMs / 60000)} 分钟兜底`)
+    recordReport('review', pair, {
+      review: pair.reviews, delivered: !!pair.reviewRequestId, trigger, digestChars: (digest.text || '').length, reviewChars: text.length,
+      workerId: pair.workerId, supervisorId: pair.supervisorId,
+      workerTokens: workerTokens ?? null, supervisorTokens: supervisorTokens ?? null,
+      workerSource: workerPressure.source, supervisorSource: supervisorPressure.source,
+      workerLimit: workerPressure.limit, supervisorLimit: supervisorPressure.limit,
+      window: workerPressure.window ?? supervisorPressure.window ?? null,
+    })
   }
 
   function releaseReview(pair) {
     pair.busy = false
+    pair.reviewParkAt = 0
+    // v3.4：只有「本轮真给出了结论」才清零连续超时计数。旧版在投递评审材料时清零，
+    // 等于把「连续超时」永久重置，熔断永远触发不了 —— 卡死的对就一直挂着不动。
+    if (pair.verdictSeen) pair.reviewTimeoutCount = 0
     if (pair.recheckAfterBusy) { pair.recheckAfterBusy = false; scheduleReview(pair, { detail: '评审期间执行会话又有新的完成上报' }, 600) }
   }
 
@@ -792,18 +1369,235 @@ export function apply(ctx, rawConfig = {}) {
     if (pair.consecutiveErrors >= 3) halt(pair, `连续 ${pair.consecutiveErrors} 次模型错误（本地模型可能断联），自动流程停止，恢复后人工继续`)
   }
 
+  /**
+   * 溢出错误专用回路（v3.1）。provider 已经拒绝请求（CONTEXT_WINDOW_EXCEEDED）时，
+   * 这个会话连同它自己的压缩都救不回来 —— 唯一有效的动作是立刻换会话接着干，
+   * 而不是把它当成「模型掉线」计入错误预算然后熔断（11-15 事故就是这么把监督对判死的）。
+   */
+  function relayOnOverflow(pair, role, detail) {
+    pair.overflowAt = Date.now()
+    pair.overflowCount = (pair.overflowCount ?? 0) + 1
+    // provider 在错误里把真实窗口报给我们（本机路由声明的是 1M，实际只吃到 524288）。
+    // 记下它：这一侧后续阈值立刻按真实窗口收紧，不再信宿主公开的 contextWindow。
+    const ceiling = parseWindowCeiling(detail)
+    if (ceiling) {
+      const sessionId = role === 'worker' ? pair.workerId : pair.supervisorId
+      const previous = observedCeilings.get(sessionId)
+      observedCeilings.set(sessionId, previous ? Math.min(previous, ceiling) : ceiling)
+      pair.observedWindow = Math.min(pair.observedWindow ?? Infinity, ceiling)
+    }
+    pushError(pair, `上下文溢出（${role === 'worker' ? '执行' : '监督'}侧第 ${pair.overflowCount} 次）：${snippet(detail, 200)}`)
+    recordReport('overflow', pair, {
+      role,
+      sessionId: role === 'worker' ? pair.workerId : pair.supervisorId,
+      detail: snippet(detail, 300),
+      handovers: pair.handovers,
+      observedCeiling: ceiling ?? null,
+      limit: pressureOf(role === 'worker' ? pair.workerId : pair.supervisorId).limit,
+      pressure: { worker: pair.lastWorkerTokens ?? null, supervisor: pair.lastSupervisorTokens ?? null },
+    })
+    warn(`context overflow on ${role} side (${pair.id}); forcing handover instead of halting${ceiling ? ` (ceiling ${kTokens(ceiling)})` : ''}`)
+    // 评审轮被溢出打断：先解锁，否则 busy 会把新会话的评审永远卡住。
+    if (role === 'supervisor' && pair.busy) { pair.busy = false; pair.verdictSeen = false }
+    if (!config.overflowRelay) { noteModelError(pair); return }
+    handoverIfNeeded(pair, role, { force: true, reason: `上下文溢出（provider 拒绝：${snippet(detail, 120)}）` })
+      .then((ok) => {
+        if (!ok) {
+          // 接力本身做不了（接力上限 / 建会话失败）才按老逻辑计入错误预算。
+          warn(`overflow relay produced no new session (${pair.id} ${role}); counting as model error`)
+          noteModelError(pair)
+          return
+        }
+        // 真实窗口上限跟着搬到新会话：上限属于这条路由，不属于某个会话。
+        if (ceiling) {
+          const newId = role === 'worker' ? pair.workerId : pair.supervisorId
+          const previous = observedCeilings.get(newId)
+          observedCeilings.set(newId, previous ? Math.min(previous, ceiling) : ceiling)
+        }
+        const other = role === 'worker' ? pair.supervisorId : pair.workerId
+        if (ceiling && other) {
+          const previous = observedCeilings.get(other)
+          observedCeilings.set(other, previous ? Math.min(previous, ceiling) : ceiling)
+        }
+      })
+      .catch((error) => { warn('overflow relay failed', error); noteModelError(pair) })
+  }
+
+  // ---------------------------------------------- 溢出自动续做（1.2.5）
+  // 客户口径：长会话会报 `400 request exceeds the context window: prompt (524520 tokens)
+  // leaves no room to answer in the context (524288); requests are never truncated`。
+  // 那种会话**连自己的压缩都救不回来**（provider 直接拒绝），唯一出路是换一个新会话接着干。
+  // 监督对里的两侧走 relayOnOverflow；这里管「散会话」（客户自己的长会话、没建对的会话）。
+  const continuations = new Map()   // 旧 sessionId -> { newId, at, depth }；新会话也带 depth 以便限链
+
+  /** 从会话事件里捞最后一次 todo 快照：续做卡靠它告诉新会话「还剩哪些没做」。 */
+  function lastTodoSnapshot(events) {
+    for (let i = (events?.length ?? 0) - 1; i >= 0; i -= 1) {
+      const event = events[i]
+      if (event?.type !== 'tool/call') continue
+      if (!/todo/i.test(String(event.data?.name ?? ''))) continue
+      let args = event.data?.arguments
+      if (typeof args === 'string') { try { args = JSON.parse(args) } catch { args = null } }
+      const rows = Array.isArray(args?.todos) ? args.todos : []
+      if (!rows.length) continue
+      return {
+        pending: rows.filter((row) => row && row.status !== 'completed').map((row) => String(row.content ?? row.item ?? '')).filter(Boolean),
+        done: rows.filter((row) => row && row.status === 'completed').map((row) => String(row.content ?? row.item ?? '')).filter(Boolean),
+      }
+    }
+    return null
+  }
+
+  async function eventsOfSession(sessionId) {
+    try {
+      const live = ctx.sessions.get(sessionId)
+      if (live && Array.isArray(live.events)) return live.events
+    } catch {}
+    try {
+      const snapshot = await ctx.sessionQuery.readSession(sessionId)
+      return snapshot?.events ?? []
+    } catch { return [] }
+  }
+
+  function continueCard(session, detail, ceiling, events) {
+    const todo = lastTodoSnapshot(events)
+    const tail = digestLinesOf(events).slice(-config.handoverTailLines)
+    return capMiddle([
+      `【溢出接力 · 自动续做】上一个会话 \`${session?.id}\` 因为上下文超过模型窗口被 provider 直接拒绝，已经无法再继续：`,
+      `  ${snippet(detail, 400)}`,
+      ceiling ? `（provider 报的真实窗口：${ceiling} tokens；本会话的水位阈值已按这个数字收紧）` : '',
+      '插件已开本会话接替它。**任务没变：接着把没做完的做完**，不要从头重做已完成的部分。',
+      todo?.pending?.length ? `原会话还没做完的待办（照这个顺序继续）：\n${todo.pending.map((t, i) => `${i + 1}. ${snippet(t, 200)}`).join('\n')}` : '',
+      todo?.done?.length ? `原会话已完成（不要重做）：\n${todo.done.map((t) => `- ${snippet(t, 160)}`).join('\n')}` : '',
+      tail.length ? '——— 原会话最后一段执行摘录 ———' : '',
+      ...tail,
+      '——— 摘录结束 ———',
+      `工作目录：${session?.cwd ?? '（沿用原会话）'}。`,
+      '规矩：先核对现场（文件/进程/日志/接口）再动手；做不完的项如实写「未做 + 原因」，不要谎报完成。',
+    ].filter(Boolean).join('\n'), config.continueCardMaxChars, '溢出续做卡')
+  }
+
+  /**
+   * 散会话溢出 → 自动开新会话接着做。
+   * 防炸：只认 session-* 真会话（mnemon-run-* 等一次性会话不续）、监督对内的交给 relayOnOverflow、
+   * 同一会话一个冷却窗口内只续一次、整条续做链有上限（overflowContinueMax）。
+   */
+  async function continueSession(session, detail) {
+    if (!config.overflowContinue) return false
+    const id = session?.id
+    if (!id) return false
+    if (!/^session-/.test(String(id))) return false
+    if (byWorker.has(id) || bySupervisor.has(id)) return false
+    if (retired.has(id)) return false
+    const known = continuations.get(id)
+    if (known && Date.now() - known.at < config.overflowContinueCooldownMs) return false
+    const depth = (known?.depth ?? 0) + 1
+    if (depth > config.overflowContinueMax) {
+      recordReport('continuation-blocked', null, { sessionId: id, depth, reason: `自动续做达到上限（${config.overflowContinueMax} 次），可能一直在溢出` })
+      warn(`overflow continuation blocked (${id}) after ${depth - 1} hops`)
+      return false
+    }
+    const ceiling = parseWindowCeiling(detail)
+    const events = await eventsOfSession(id)
+    let newId
+    try {
+      newId = await createSession(session?.cwd ?? undefined)
+    } catch (error) {
+      warn(`overflow continuation create failed (${id})`, error)
+      recordReport('continuation-failed', null, { sessionId: id, reason: snippet(error?.message ?? error, 200) })
+      return false
+    }
+    continuations.set(id, { newId, at: Date.now(), depth })
+    continuations.set(newId, { newId: null, at: 0, depth })   // 新会话继承链深
+    if (ceiling) observedCeilings.set(newId, ceiling)          // 真实窗口跟着搬到新会话
+    const note = continueCard(session, detail, ceiling, events)
+    const title = `续做#${depth}｜${snippet(String(session?.title ?? '') || id.slice(-8), 40)}`
+    try { setTitle(newId, title) } catch {}
+    recordReport('continuation', null, {
+      sessionId: id, newId, depth, ceiling: ceiling ?? null,
+      reason: snippet(detail, 300),
+      todoPending: lastTodoSnapshot(events)?.pending?.length ?? 0,
+    })
+    // 新会话先拿到料（它还没跑，直接投），再停老会话：顺序反过来会先丢现场。
+    try {
+      await deliver(newId, 'continue', note)
+    } catch (error) {
+      warn(`overflow continuation delivery failed (${id} -> ${newId})`, error)
+      recordReport('continuation-failed', null, { sessionId: id, newId, reason: snippet(error?.message ?? error, 200) })
+    }
+    setTitle(id, `（已溢出接力→${String(newId).slice(-8)}）${snippet(String(session?.title ?? ''), 30)}`)
+    await stopSessionRun(id, '上下文溢出：provider 拒绝请求，已换新会话续做').catch(() => {})
+    warn(`overflow continuation: ${id} -> ${newId} (depth ${depth}${ceiling ? `, ceiling ${ceiling}` : ''})`)
+    return true
+  }
+
   // ---------------------------------------------------------------- events
+
+  // ---- v1.3.0 文本工具调用守卫 -------------------------------------------
+  // 只认「正文里写了调用标记」= <tool_call> / <function=xxx>；结构化 tool-call 不会出现在 text 块里。
+  const TEXT_CALL_RE = /<tool_call[\s>]|<function\s*=\s*[a-zA-Z_]/
+  const textCallReminder = (role, attempts, max, escalate) => [
+    `【工具调用写成了正文】你上一步把工具调用写成了正文（<tool_call> / <function=…>），DSH 只执行结构化 tool-call，这一轮没有任何工具被执行，任务实际上停在这一步。`,
+    `本机 shell 工具名是 pwsh（不存在 exec 工具）：要跑命令就直接发 pwsh 的结构化 tool-call，把命令放进 command 参数；不要再写 <tool_call>/<function=…>/<parameter=…> 这类文本标记。`,
+    escalate
+      ? `这是第 ${attempts}/${max} 次纠正：不要再解释、不要复述计划，下一步必须立刻产生至少一个真实工具调用；若你认为任务已完成，就直接给出结论并列出已完成项。`
+      : `（第 ${attempts}/${max} 次纠正）请立刻用真实工具调用把该做的动作重发一遍。`,
+  ].join('\n')
+
+  /**
+   * 每来一个事件喂一次：assistant/message 认标记、tool/call 记本轮真实调用数、
+   * turn/end 收口判定并注入纠正。串行走 serialDeliver，因此不会和监督轮抢通道。
+   */
+  function noteTextCall(pair, role, event) {
+    if (!config.textToolCallGuard) return
+    const side = ((pair.textCallSide ??= {})[role] ??= { pending: false, calls: 0, rounds: 0 })
+    if (event?.type === 'assistant/message') {
+      side.saw = true
+      const blocks = event.data?.message?.content
+      if (!Array.isArray(blocks)) return
+      const text = blocks.filter((b) => b?.type === 'text').map((b) => String(b.text ?? '')).join('\n')
+      if (text && TEXT_CALL_RE.test(text)) { side.pending = true; side.at = Date.now() }
+      return
+    }
+    if (event?.type === 'tool/call') { side.saw = true; side.calls += 1; return }
+    if (event?.type !== 'turn/end') return
+    const flagged = side.pending === true
+    const hadCalls = side.calls > 0
+    const sawAnything = side.saw === true
+    const round = event.data?.turn ?? null
+    side.pending = false
+    side.calls = 0
+    side.saw = false
+    // 空轮（既没有 assistant 消息也没有工具调用，例如只剩一条排队投递落地）不参与计数、也不清零
+    if (!sawAnything && !hadCalls) return
+    if (!flagged || hadCalls) { side.rounds = 0; return }  // 干净一轮（无标记，或真有工具执行）→ 预算回满
+    side.rounds += 1
+    if (side.rounds > config.textToolCallGuardMax) {
+      recordReport('text-toolcall', pair, { role, round, attempts: side.rounds, action: 'give-up' })
+      return
+    }
+    recordReport('text-toolcall', pair, { role, round, attempts: side.rounds, action: 'retry' })
+    const sessionId = role === 'worker' ? pair.workerId : pair.supervisorId
+    if (!sessionId) return
+    serialDeliver(pair, 'text-toolcall', sessionId, textCallReminder(role, side.rounds, config.textToolCallGuardMax, side.rounds >= 2))
+      .catch((error) => warn('text tool-call reminder failed', error))
+  }
 
   function onWorkerEvent(pair, event) {
     if (pair.state !== 'active') return
     pair.lastActivity = Date.now()
+    noteTextCall(pair, 'worker', event)
     if (event?.type === 'turn/end') {
       const reason = event.data?.reason ?? {}
       pair.lastTurnEndAt = Date.now()
       touchJournal(pair)
+      if (reason.kind === 'error' && isOverflow(reason.error)) {
+        relayOnOverflow(pair, 'worker', reason.error?.message ?? reason.error)
+        return
+      }
       // 上下文达线：不等上报，也在空闲点把执行会话接力到新会话（老会话随即停止运行）
-      const pressure = contextTokens(pair.workerId) ?? 0
-      if (pressure >= config.maxContextTokens && pairIdle(pair)) {
+      const pressure = pressureOf(pair.workerId)
+      if (pressure.over && pairIdle(pair)) {
         handoverIfNeeded(pair, 'worker').catch((error) => warn('post-turn handover failed', error))
       }
       if (reason.kind === 'error') {
@@ -825,11 +1619,17 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   function onSupervisorEvent(pair, event) {
+    pair.supervisorLastEventAt = Date.now()
+    noteTextCall(pair, 'supervisor', event)
     if (event?.type !== 'turn/end') return
     pair.supervisorIdleSince = Date.now()
     if (!pair.busy) return
     const reason = event.data?.reason ?? {}
     if (reason.kind === 'error' && !pair.verdictSeen) {
+      if (isOverflow(reason.error)) {
+        relayOnOverflow(pair, 'supervisor', reason.error?.message ?? reason.error)
+        return
+      }
       pushError(pair, `监督评审轮自身错误: ${reason.error?.message ?? ''}`)
       noteModelError(pair)
       return
@@ -866,30 +1666,68 @@ export function apply(ctx, rawConfig = {}) {
     let pair = byWorker.get(session?.id)
     if (pair) { onWorkerEvent(pair, event); return }
     pair = bySupervisor.get(session?.id)
-    if (pair) onSupervisorEvent(pair, event)
+    if (pair) { onSupervisorEvent(pair, event); return }
+    // v1.2.5 散会话溢出（有的路由把溢出报在 turn/end 的 reason.error 里，不是 agent/error）
+    if (event?.type === 'turn/end') {
+      const reason = event.data?.reason ?? {}
+      if (reason.kind === 'error' && isOverflow(reason.error)) {
+        continueSession(session, reason.error?.message ?? reason.error).catch((error) => warn('overflow continuation failed', error))
+      }
+    }
   })
 
   ctx.on('agent/status', function (payload) {
     const running = payload?.status === 'running'
+    // 全局单通道账本：本地模型只有一个推理通道，任何时刻只该有一个会话在跑。
+    // 这里记录【全宿主】的活跃会话（不只本对），投递前用它排队（见 waitChannelFree）。
+    const liveId = payload?.agent?.id
+    if (liveId) {
+      if (running) { if (!liveAgents.has(liveId)) liveAgents.set(liveId, { since: Date.now(), updatedAt: Date.now(), seenAt: Date.now() }); else liveAgents.get(liveId).updatedAt = Date.now() }
+      else liveAgents.delete(liveId)
+      // 通道刚空出来：所有压着排队投递的对立刻重试（这是「别人在干活 → 一干完就补发」的关键节拍）
+      if (!running) for (const p of pairs.values()) if ((p.pendingDeliveries ?? []).length > 0) armDrain(p, 500)
+    }
     const worker = byWorker.get(payload?.agent?.id)
     if (worker) {
       if (running && !worker.workerRunning) worker.workerRunningSince = Date.now()
       worker.workerRunning = running
       if (running) worker.lastActivity = Date.now()
+      // 变空闲的那一刻是补发排队投递的最佳时机（看门狗要 15~20s 才扫一遍）
+      if (!running && (worker.pendingDeliveries ?? []).length > 0) armDrain(worker, 200)
       return
     }
     const supervisor = bySupervisor.get(payload?.agent?.id)
     if (supervisor) {
       if (running && !supervisor.supervisorRunning) supervisor.supervisorRunningSince = Date.now()
       supervisor.supervisorRunning = running
+      if (!running && (supervisor.pendingDeliveries ?? []).length > 0) armDrain(supervisor, 200)
     }
   })
 
   ctx.on('agent/error', function (payload) {
-    const pair = byWorker.get(payload?.agent?.id)
-    if (!pair || pair.state !== 'active') return
-    pushError(pair, `agent/error turn=${payload.turn} step=${payload.step} ${payload.error?.message ?? payload.error}`)
-    noteModelError(pair)
+    const message = payload?.error?.message ?? payload?.error ?? ''
+    const worker = byWorker.get(payload?.agent?.id)
+    if (worker && worker.state === 'active') {
+      pushError(worker, `agent/error turn=${payload.turn} step=${payload.step} ${message}`)
+      if (isOverflow(payload?.error) || isOverflow(message)) { relayOnOverflow(worker, 'worker', message); return }
+      noteModelError(worker)
+      return
+    }
+    const supervisor = bySupervisor.get(payload?.agent?.id)
+    if (supervisor && supervisor.state === 'active' && (isOverflow(payload?.error) || isOverflow(message))) {
+      pushError(supervisor, `agent/error(监督侧) ${message}`)
+      relayOnOverflow(supervisor, 'supervisor', message)
+      return
+    }
+    // v1.2.5 散会话（没建对的客户会话）溢出：自动开新会话接着做未完成的活
+    if (isOverflow(payload?.error) || isOverflow(message)) {
+      const sessionId = payload?.agent?.id
+      if (sessionId) {
+        let session
+        try { session = ctx.sessions.get(sessionId) } catch {}
+        if (session) continueSession(session, message).catch((error) => warn('overflow continuation failed', error))
+      }
+    }
   })
 
   // Watchdog: unstick a hung review turn (single-slot model must not be held forever),
@@ -897,26 +1735,90 @@ export function apply(ctx, rawConfig = {}) {
   // reviewed: nudge once, then force a review after idleForceReviewMs.
   ctx.timer.interval(() => {
     const now = Date.now()
+    watchdogAt = now
+    // 每轮扫描顺带校正一次单通道账本（事件只覆盖加载之后的会话状态）
+    syncChannelRoster().catch(() => {})
     for (const pair of pairs.values()) {
       if (pair.state !== 'active') continue
       // v3 空闲点接力：任一侧水位达线且双方都不在跑模型，就换会话（评审期间的接力在 runReview 内）
       if (config.reviewEnabled && !pair.busy && !pair.reviewTimerOn && pairIdle(pair)
         && (!pair.lastHandoverAt || now - pair.lastHandoverAt > config.rolloverCooldownMs)) {
-        const over = contextTokens(pair.workerId) ?? 0
-        const overSupervisor = contextTokens(pair.supervisorId) ?? 0
-        if (over >= config.maxContextTokens || overSupervisor >= config.maxContextTokens) {
-          handoverIfNeeded(pair, over >= config.maxContextTokens ? 'worker' : 'supervisor')
+        const workerPressure = pressureOf(pair.workerId)
+        const supervisorPressure = pressureOf(pair.supervisorId)
+        if (workerPressure.over || supervisorPressure.over) {
+          handoverIfNeeded(pair, workerPressure.over ? 'worker' : 'supervisor')
             .catch((error) => warn('idle rollover failed', error))
         }
       }
-      const handAt = Math.max(pair.supervisorIdleSince ?? 0, pair.lastSupervisorHand ?? 0)
-      if (
-        config.reviewTurnTimeoutMs > 0 && pair.busy
-        && handAt && now - handAt > config.reviewTurnTimeoutMs
-      ) {
+      // 待重投队列（v3.3）：每轮最多补发一条，且不占用串行链；饿死超时就强行放行。
+      drainPendingDeliveries(pair, now)
+      // 评审计时（v3.3）：起点 = 材料送达，之后【监督侧任何进展】都刷新起点。
+      // 旧口径（固定 15/30 分钟就砍）在本机是误杀：监督侧要在单通道排队 + 自己跑十几项
+      // 服务端取证，一轮 30~40 分钟很正常（11-16 实测：连续 3 次超时把整对打成 halted，
+      // 客户因此看到「会话监督不起作用」）。现在只有「完全没进展」才算卡死。
+      const handAt = Math.max(pair.lastSupervisorHand || 0, pair.supervisorIdleSince || 0, pair.supervisorLastEventAt || 0)
+      // 软超时：监督侧毫无进展超过 reviewTurnTimeoutMs；硬上限：从送达起超过 reviewHardCapMs 一定中止
+      // （进展豁免只豁免「慢」，不豁免「永不收敛」）。
+      const softOverdue = handAt > 0 && pair.supervisorRunning !== true && now - handAt > config.reviewTurnTimeoutMs
+      const hardOverdue = pair.lastSupervisorHand > 0 && now - pair.lastSupervisorHand > config.reviewHardCapMs
+      // 材料还压在待投队列里（没送达就不起评审计时）—— 但也不能永远压着：
+      // v3.4 停车超时：压过 reviewTurnTimeoutMs 就当本轮「未通过」收口，否则 pair.busy 永不释放。
+      const parkedOverdue = !pair.lastSupervisorHand && pair.reviewParkAt > 0 && now - pair.reviewParkAt > config.reviewTurnTimeoutMs
+      if (config.reviewTurnTimeoutMs > 0 && pair.busy && (softOverdue || hardOverdue || parkedOverdue)) {
+        const timedOutFrom = parkedOverdue ? pair.reviewParkAt : hardOverdue && !softOverdue ? pair.lastSupervisorHand : handAt
+        const reason = parkedOverdue ? '评审材料停投' : hardOverdue ? '硬上限' : '无进展'
         pair.supervisorRunningSince = 0
-        pushError(pair, `监督评审轮超过 ${Math.round(config.reviewTurnTimeoutMs / 60000)} 分钟未结束，插件已中止该轮（防串行死等）`)
+        pair.reviewTimeoutCount = (pair.reviewTimeoutCount ?? 0) + 1
+        const waitedMin = Math.round((now - timedOutFrom) / 60000)
+        pushError(pair, `监督评审轮 ${waitedMin} 分钟未给结论（第 ${pair.reviewTimeoutCount}/${config.maxReviewTimeouts} 次，${reason}），插件已中止该轮并收口`)
+        recordReport('review-timeout', pair, { review: pair.reviews, waitedMs: now - timedOutFrom, count: pair.reviewTimeoutCount, hard: hardOverdue, starved: parkedOverdue })
+        if (parkedOverdue) {
+          // 本轮材料作废：收口后再补投会让监督对着已过期的现场重评一遍
+          const before = (pair.pendingDeliveries ?? []).length
+          pair.pendingDeliveries = (pair.pendingDeliveries ?? []).filter((row) => row.tag !== 'review')
+          if (before !== pair.pendingDeliveries.length) recordReport('delivery-dropped', pair, { tag: 'review', reason: '评审轮因材料停投超时收口' })
+        }
         try { ctx.agents.get(pair.supervisorId)?.cancel({ kind: 'user', reason: 'session-supervisor review timeout' }) } catch (error) { warn('supervisor cancel failed', error) }
+        // 关键（2026-11-15 事故根因）：超时只 cancel 不收口，pair.busy 就永远是 true，
+        // runReview 的 `if (pair.busy) return` 会把之后每一次评审都挡在门外 —— 这对就整轮空转。
+        pair.busy = false
+        pair.verdictSeen = false
+        pair.nudges = 0
+        pair.forcedReviewAt = 0
+        pair.phase = 'fixing'
+        pair.reviewParkAt = 0
+        if (pair.reviewTimeoutCount >= config.maxReviewTimeouts) {
+          halt(pair, `评审连续 ${pair.reviewTimeoutCount} 次未在 ${Math.round(config.reviewTurnTimeoutMs / 60000)} 分钟内给出结论（监督侧模型延迟/上下文过大），自动流程停止：请人工检查监督会话后继续`)
+        } else {
+          serialDeliver(pair, 'notice', pair.workerId, [
+            `【监督系统提示】监督评审 #${pair.reviews} 超过 ${Math.round(config.reviewTurnTimeoutMs / 60000)} 分钟没给结论，插件已中止该轮并按「未通过」处理（第 ${pair.reviewTimeoutCount}/${config.maxReviewTimeouts} 次）。`,
+            '你要做的只有一件事：把当前进展与真实证据直接写进 supervision_done 摘要（做不完的项写明「未做 + 原因」），不要空等评审结论。',
+          ].join('\n')).catch((error) => warn('review timeout notice failed', error))
+          scheduleReview(pair, { detail: `上一轮评审超时被中止（第 ${pair.reviewTimeoutCount} 次），重新评审` }, 3000)
+        }
+      }
+      // 执行侧单轮超时：旧版 workerRunning=true 时插件完全静默，客户看到的就是「几小时没动」。
+      if (
+        config.workerTurnTimeoutMs > 0 && pair.workerRunning && pair.workerRunningSince
+        && now - pair.workerRunningSince > config.workerTurnTimeoutMs
+      ) {
+        pair.workerTimeoutCount = (pair.workerTimeoutCount ?? 0) + 1
+        const ranMin = Math.round((now - pair.workerRunningSince) / 60000)
+        pushError(pair, `执行会话单轮已跑 ${ranMin} 分钟未收口（第 ${pair.workerTimeoutCount}/${config.maxWorkerTimeouts} 次），插件已中止该轮`)
+        recordReport('worker-timeout', pair, { turnMs: now - pair.workerRunningSince, count: pair.workerTimeoutCount, review: pair.reviews })
+        try { ctx.agents.get(pair.workerId)?.cancel({ kind: 'user', reason: 'session-supervisor worker turn timeout' }) } catch (error) { warn('worker cancel failed', error) }
+        pair.workerRunningSince = 0
+        if (pair.workerTimeoutCount >= config.maxWorkerTimeouts) {
+          halt(pair, `执行会话连续 ${pair.workerTimeoutCount} 次单轮超过 ${Math.round(config.workerTurnTimeoutMs / 60000)} 分钟仍未收口，自动流程停止：请人工确认它是否卡在无超时的命令上（ssh/长任务）`)
+        } else {
+          serialDeliver(pair, 'notice', pair.workerId, [
+            `【监督系统提示】你这一轮已经连续跑了 ${ranMin} 分钟仍未结束，插件已中止本轮（第 ${pair.workerTimeoutCount}/${config.maxWorkerTimeouts} 次）。`,
+            '接下来三条硬要求：',
+            '1) 任何 `ssh`/长任务必须带超时（pwsh 用 `-TimeoutSec`，命令内 `curl -m`，别裸 ssh 等密码提示）；',
+            '2) 先把已完成的部分落盘（脚本/日志/证据文件），别只在脑内推演；',
+            '3) 立刻继续剩余工作，或直接调用 supervision_done 如实上报当前进展（做不完的项写「未做 + 原因」）。',
+          ].join('\n')).catch((error) => warn('worker timeout notice failed', error))
+        }
       }
       if (!config.reviewEnabled) continue
       // 上报兜底：执行侧自己停了（或收到了整改指令）但没调 supervision_done
@@ -1013,6 +1915,15 @@ export function apply(ctx, rawConfig = {}) {
       lastTurnEndAt: 0,
       nudgeAt: 0,
       forcedReviewAt: 0,
+      // v3.2 卡死收口记账
+      reviewTimeoutCount: 0,
+      workerTimeoutCount: 0,
+      pendingDeliveries: [],
+      drainAt: 0,
+      lastDrainAt: 0,
+      // v1.2.4 上下文分段：{ parts, index, limit, budget, planAt, partDoneAt }
+      splitPlan: null,
+      deferredByChannel: 0,
       lastFixRound: 0,
       lastFixSummary: null,
       lastFixInstructions: null,
@@ -1021,6 +1932,7 @@ export function apply(ctx, rawConfig = {}) {
       fixRequestId: undefined,
       supervisorIdleSince: 0,
       lastSupervisorHand: 0,
+      reviewParkAt: 0,
       rolling: new Set(),
       lastHandoverAt: 0,
       lastWorkerHandoverAt: 0,
@@ -1253,6 +2165,9 @@ export function apply(ctx, rawConfig = {}) {
       if (config.debugEnrollTrace === true) { try { fs.appendFileSync(path.join(storeDir, 'auto-enroll.log'), line + '\n') } catch {} }
     }
     if (!config.autoEnrollReview || !config.reviewEnabled) return trace('skip', 'disabled')
+      // 一次性/委派会话（mnemon-run-*、无 session- 前缀的 worker 会话）不建对：
+      // 它们跑完就没了，建对只会留下一个永远不动的「幽灵监督对」（11-16 实测 sup-1-ures6）。
+      if (!/^session-/.test(String(session?.id ?? ''))) return trace('skip', `ephemeral-session=${session?.id}`)
     if (byWorker.get(session?.id) || bySupervisor.get(session?.id)) return trace('skip', 'already-in-pair')
     if (retired.has(session?.id)) return trace('skip', 'retired-session')
     if (boundPairId(session?.id)) return trace('skip', `bound-pair=${boundPairId(session?.id)}`)
@@ -1377,6 +2292,8 @@ export function apply(ctx, rawConfig = {}) {
           record.reviews += 1
           record.workerId = data.workerId ?? record.workerId
           record.supervisorId = data.supervisorId ?? record.supervisorId
+          record.lastReviewAt = event.at
+          if (record.state === 'active') record.phase = 'reviewing'
         }
       } else if (event.kind === 'verdict') {
         record.lastVerdict = data.verdict ?? record.lastVerdict
@@ -1425,6 +2342,17 @@ export function apply(ctx, rawConfig = {}) {
       pair.cardDelivered = true
       pair.reportPending = null
       pair.lastTurnEndAt = Date.now()
+      // 重载/重启复原：上次停在评审中的对要恢复 busy 与「评审起手时间」，
+      // 否则看门狗算不出它已经卡了多久，永远收不了口（11-15 卡死就是这么来的）。
+      if (record.phase === 'reviewing') {
+        pair.busy = true
+        pair.phase = 'reviewing'
+        pair.lastSupervisorHand = record.lastReviewAt ?? record.at ?? record.createdAt ?? Date.now()
+      }
+      // 复原后单轮计时的起点用「上次事件时间」兜底：否则重载后 worker 明明在跑却永远不算超时。
+      if (record.phase !== 'done' && record.phase !== 'stopped' && record.phase !== 'halted') {
+        pair.workerRunningSince = record.at ?? 0
+      }
       installPair(pair)
       for (const row of record.lineage) if (row?.previousId) markRetired(row.previousId, pair, row.side === 'worker' ? 'worker' : 'supervisor')
       materialized.push(pair)
@@ -1472,13 +2400,36 @@ export function apply(ctx, rawConfig = {}) {
     auto: !!pair.auto,
     reportPending: pair.reportPending ?? null,
     serial: { workerRunning: pair.workerRunning, supervisorRunning: pair.supervisorRunning, reviewInFlight: pair.busy },
+    // 客户最关心的「到底跑多久了」：单轮运行时长与超时记账（旧版这里完全看不到，只能靠猜）
+    running: {
+      workerSeconds: pair.workerRunning && pair.workerRunningSince ? Math.round((Date.now() - pair.workerRunningSince) / 1000) : 0,
+      supervisorSeconds: pair.supervisorRunning && pair.supervisorRunningSince ? Math.round((Date.now() - pair.supervisorRunningSince) / 1000) : 0,
+      sinceSupervisorHandSeconds: pair.lastSupervisorHand ? Math.round((Date.now() - pair.lastSupervisorHand) / 1000) : 0,
+      reviewTimeouts: `${pair.reviewTimeoutCount ?? 0}/${config.maxReviewTimeouts}`,
+      workerTimeouts: `${pair.workerTimeoutCount ?? 0}/${config.maxWorkerTimeouts}`,
+      deferredDelivery: (pair.pendingDeliveries ?? []).map((row) => row.tag).join('/') || null,
+      queuedDeliveries: (pair.pendingDeliveries ?? []).length,
+      watchdogSeconds: watchdogAt ? Math.round((Date.now() - watchdogAt) / 1000) : null,
+      // 本地模型单通道：这里能直接看到「现在有几路在抢通道」，>0 时插件不会插队
+      channel: { others: channelOthers(pair).length, samples: channelOthers(pair).slice(0, 4), deferredByChannel: pair.deferredByChannel ?? 0, source: channelSource, guard: config.channelGuard },
+    },
     workerSessionId: pair.workerId,
     supervisorSessionId: pair.supervisorId,
     context: {
-      worker: contextTokens(pair.workerId) ?? pair.lastWorkerTokens ?? null,
-      supervisor: contextTokens(pair.supervisorId) ?? pair.lastSupervisorTokens ?? null,
-      limit: config.maxContextTokens,
+      worker: pressureOf(pair.workerId).tokens ?? pair.lastWorkerTokens ?? null,
+      supervisor: pressureOf(pair.supervisorId).tokens ?? pair.lastSupervisorTokens ?? null,
+      limit: pressureOf(pair.workerId).limit,
+      window: pressureOf(pair.workerId).window ?? pressureOf(pair.supervisorId).window ?? null,
+      ceiling: ceilingOf(pair.workerId) ?? ceilingOf(pair.supervisorId) ?? null,
+      declaredWindow: pressureOf(pair.workerId).declaredWindow ?? null,
+      source: pressureOf(pair.workerId).source,
+      supervisorSource: pressureOf(pair.supervisorId).source,
+      remaining: pressureOf(pair.workerId).remaining,
       handovers: `${pair.handovers}/${config.maxHandovers}`,
+      overflowCount: pair.overflowCount ?? 0,
+      // v1.2.4：客户设的上下文大小 + 当前分段进度（`2/5` 表示正在做第 2 段，共 5 段）
+      splitTokens: config.contextSplitTokens > 0 ? config.contextSplitTokens : null,
+      split: pair.splitPlan ? `${pair.splitPlan.index}/${pair.splitPlan.parts.length}` : null,
     },
     lineage: pair.lineage,
     retiredSessions: retiredSides(pair),
@@ -1525,8 +2476,9 @@ export function apply(ctx, rawConfig = {}) {
           `监督会话：${pair.supervisorId}`,
           `工作目录：${pair.cwd ?? '(默认)'}`,
           '评审时机：执行会话【全部完成】并 supervision_done 后才触发一次评审；中间步骤不评审。串行：一方跑完才轮到另一方。',
-          `熔断：修复上限 ${config.maxFixRounds} 轮、评审预算 ${config.maxReviews}、接力上限 ${config.maxHandovers}、连续 3 次模型错误自动停止。`,
-          `上下文：双方水位达 ${kTokens(config.maxContextTokens)} 自动开新会话接力（交接卡自包含）。`,
+          `上下文：执行/监督两侧水位各自测得（来源 ${pressureOf(pair.workerId).source}），阈值 ${kTokens(limitFor(pressureOf(pair.workerId).window))}（窗口减预留 ${kTokens(config.contextReserveTokens)}）；达阈值自动开新会话接力，投递前还会按剩余额度裁剪，provider 若先拒请求则立即紧急接力。`,
+          '熔断：修复上限 ' + config.maxFixRounds + ' 轮、评审预算 ' + config.maxReviews + '、接力上限 ' + config.maxHandovers + '、连续 3 次模型错误自动停止（上下文溢出不计入，走接力）。',
+          channelAdvice(pair).trim(),
           '用 supervision_status 查看进度；supervision_review 人工提前评审；supervision_stop 结束监督。',
         ].join('\n'),
       }
@@ -1565,7 +2517,9 @@ export function apply(ctx, rawConfig = {}) {
           ].join('\n'),
         }
       }
-      return { text: `当前会话已纳入监督：${pair.id}\n监督会话：${pair.supervisorId}\n全部完成时调用 supervision_done 才触发评审。` }
+      return {
+        text: `当前会话已纳入监督：${pair.id}\n监督会话：${pair.supervisorId}\n全部完成时调用 supervision_done 才触发评审。${channelAdvice(pair)}`,
+      }
     },
   })
 
@@ -1595,6 +2549,27 @@ export function apply(ctx, rawConfig = {}) {
       pair.reportPending = 'done'
       pair.reportAt = Date.now()
       pair.nudgeAt = 0
+      // 正常上报说明执行侧没卡死：超时计数清零（连续卡死才熔断）
+      pair.workerTimeoutCount = 0
+      // v1.2.4 分段推进：本段做完只推进到下一段，**不进评审**；最后一段才进评审。
+      const split = pair.splitPlan
+      if (split && split.index <= split.parts.length) {
+        const finished = split.index
+        if (finished < split.parts.length) {
+          split.index = finished + 1
+          split.partDoneAt = Date.now()
+          recordReport('context-split', pair, {
+            action: 'part-done', part: finished, total: split.parts.length,
+            nextPart: split.index, summary: snippet(args.summary, 400),
+          })
+          scheduleSplitPart(pair, 800)
+          return { text: `第 ${finished}/${split.parts.length} 段已记录（本轮不进评审）。插件将把第 ${split.index}/${split.parts.length} 段发给新会话按顺序继续。` }
+        }
+        pair.splitPlan = null
+        recordReport('context-split', pair, { action: 'all-parts-done', total: split.parts.length, summary: snippet(args.summary, 400) })
+        scheduleReview(pair, { detail: `执行会话声称已全部完成（分段 ${split.parts.length}/${split.parts.length}）：${snippet(args.summary, 240)}` }, 1200)
+        return { text: `第 ${split.parts.length}/${split.parts.length} 段（最后一段）已完成，插件将串行送监督评审。请保持空闲等待结论。` }
+      }
       scheduleReview(pair, { detail: `执行会话声称已全部完成：${snippet(args.summary, 240)}` }, 1200)
       return { text: '已上报「全部完成」，插件将在本轮结束后串行送监督评审。请保持空闲等待结论。' }
     },
@@ -1616,6 +2591,42 @@ export function apply(ctx, rawConfig = {}) {
       if (pair.state !== 'active') throw new Error(`pair ${pair.id} is ${pair.state}`)
       scheduleReview(pair, { detail: `人工触发评审：${snippet(args.note ?? '客户要求中途检查', 200)}` }, 500)
       return { text: `已为监督对 ${pair.id} 排队一次人工评审（串行送达）。` }
+    },
+  })
+
+  // v1.2.4 分段：先看计划（dry-run），确认后 apply —— 客户的「超过设定大小就拆分、按顺序完成」
+  // 平时由看门狗在水位到线时自动触发；这个工具用于超限前主动分段、或只想看拆分结果。
+  ctx.tools.register({
+    name: 'supervision_split',
+    description: 'Split the pair\'s remaining work into ordered context segments (v1.2.4). Dry-run returns the plan; apply=true immediately opens a new executor session and starts from the segment 1. Triggered automatically when context exceeds the customer-set contextSplitTokens (e.g. 512K/1M).',
+    parameters: {
+      type: 'object',
+      properties: {
+        pairId: { type: 'string', description: 'Supervision pair id; omit when only one pair exists.' },
+        apply: { type: 'boolean', description: 'true = start executing segment 1 in a fresh executor session now (default false = plan only).' },
+        tokens: { type: 'number', description: 'Override the per-segment token budget for this plan (e.g. 524288 / 1048576).' },
+      },
+    },
+    output: textOutput,
+    async execute(args, exec) {
+      const pair = resolvePair(args.pairId, exec.agent)
+      if (pair.state !== 'active') throw new Error(`pair ${pair.id} is ${pair.state}; 只有 active 的对能分段`)
+      const pressure = pressureOf(pair.workerId)
+      const budget = typeof args.tokens === 'number' && args.tokens >= 100 ? Math.floor(args.tokens) : undefined
+      const plan = planSplit(pair, pressure, budget)
+      const lines = [
+        `监督对 ${pair.id}「${pair.name}」分段计划：共 ${plan.parts.length} 段（每段预算 ≈${plan.budget} 字 / 阈值 ${tokenLabel(plan.limit)}）。`,
+        pressure.tokens !== undefined ? `执行侧当前水位 ${pressureText(pressure)}` : '执行侧水位未知（不影响分段，计划按需求条目切）',
+        ...plan.parts.map((part, index) => `\n第 ${index + 1}/${plan.parts.length} 段（${part.length} 项）：\n${part.map((item, i) => `  ${i + 1}. ${snippet(item.text, 200)}`).join('\n')}`),
+      ]
+      if (!args.apply) {
+        recordReport('context-split', pair, { action: 'plan', total: plan.parts.length, budget: plan.budget, limit: plan.limit, tokens: pressure.tokens ?? null, dryRun: true })
+        return { text: lines.join('\n') + '\n\n（dry-run，未开工。要按这个计划开始分段执行，用 supervision_split apply=true。）' }
+      }
+      if (plan.parts.length <= 1) return { text: lines.join('\n') + '\n\n只剩一段，不需要分段（直接用普通接力/直接干）。' }
+      pair.splitPlan = plan
+      const started = await handoverIfNeeded(pair, 'worker', { force: true, split: true, reason: '客户主动分段（supervision_split apply）' })
+      return { text: lines.join('\n') + (started ? '\n\n已开新执行会话，正在投第 1 段。' : '\n\n分段启动被拒（可能正在接力/已达接力上限），见 supervision_status.recentErrors。') }
     },
   })
 
@@ -1714,7 +2725,7 @@ export function apply(ctx, rawConfig = {}) {
         pair.phase = 'done'
         recordReport('verdict', pair, { verdict: 'complete', review: pair.reviews, summary: snippet(args.summary, 4000), checklist: checklistText(args.checklist) })
         releaseReview(pair)
-        serialDeliver(pair, 'notice', pair.workerId, `【监督结论】评审通过，任务关闭。逐项验收依据：\n${checklistText(args.checklist)}\n\n结论摘要：${args.summary}`).catch((error) => warn('done notice failed', error))
+        serialDeliver(pair, 'notice', pair.workerId, capMiddle(`【监督结论】评审通过，任务关闭。逐项验收依据：\n${capMiddle(checklistText(args.checklist), config.checklistNoteMaxChars, '验收依据')}\n\n结论摘要：${capMiddle(args.summary, config.fixSummaryMaxChars, '结论摘要')}`, config.deliverMaxChars, '结论通知')).catch((error) => warn('done notice failed', error))
         return { text: `结论已记录：complete（逐项核验 ${gate.checklist.length} 项全部有证据）。监督对 ${pair.id} 已关闭（自动评审停止）。请向客户简要汇报验收结论。` }
       }
       pair.lastVerdict = args.verdict
@@ -1730,14 +2741,14 @@ export function apply(ctx, rawConfig = {}) {
       pair.fixRounds += 1
       pair.phase = 'fixing'
       recordReport('verdict', pair, { verdict: 'needs_fix', review: pair.reviews, fixRound: pair.fixRounds, summary: snippet(args.summary, 4000), fixInstructions: snippet(args.fixInstructions, 4000), checklist: checklistText(args.checklist) })
-      const instruction = [
+      const instruction = capMiddle([
         `【监督修复指令 #${pair.fixRounds}】监督者逐项复现后发现以下问题（下列每一条都必须整改并自证，缺一不可）：`,
-        `症状：${args.summary}`,
-        `修复要求：${args.fixInstructions}`,
-        `监督逐项核验记录：\n${checklistText(args.checklist) || '（监督未提供逐项清单）'}`,
-        `上下文互审：监督侧 ≈${kTokens(pair.lastSupervisorTokens)}，执行侧 ≈${kTokens(pair.lastWorkerTokens)}（上限 ${kTokens(config.maxContextTokens)}）。`,
+        `症状：${capMiddle(args.summary, config.fixSummaryMaxChars, '症状（全文见 supervision_reports）')}`,
+        `修复要求：${capMiddle(args.fixInstructions, config.fixInstrMaxChars, '修复要求（全文见 supervision_reports(需要审查) 的 verdict 记录）')}`,
+        `监督逐项核验记录：\n${capMiddle(checklistText(args.checklist) || '（监督未提供逐项清单）', config.checklistNoteMaxChars, '核验记录')}`,
+        `上下文互审：${sidePressureLine(pair, 'supervisor')}；${sidePressureLine(pair, 'worker')}。`,
         '请修复并完成必要验证后，再次调用 supervision_done 上报（摘要里逐项写「第 N 项：做了什么 + 真实输出」；一次上报全部修完的结果；修复前保持原任务上下文；不上报监督不会复查）。',
-      ].join('\n')
+      ].filter(Boolean).join('\n'), config.deliverMaxChars, '整改指令')
       pair.lastFixRound = pair.fixRounds
       pair.lastFixSummary = args.summary
       pair.lastFixInstructions = args.fixInstructions
@@ -1764,6 +2775,7 @@ export function apply(ctx, rawConfig = {}) {
     },
     output: textOutput,
     execute(args) {
+      nudgeQueuedDrains()
       const selected = args.pairId ? [resolvePair(args.pairId)] : [...pairs.values()]
       const trace = config.debugEnrollTrace === true ? enrollTrace.slice(-8) : []
       const traceText = trace.length ? `\n【自动纳入监督诊断】\n${trace.join('\n')}` : ''
@@ -1798,7 +2810,10 @@ export function apply(ctx, rawConfig = {}) {
       }
       const maxLines = Math.max(1, typeof args.maxLines === 'number' ? args.maxLines : 150)
       const kept = lines.slice(-maxLines)
-      return { text: `${lines.length > kept.length ? `…(更早 ${lines.length - kept.length} 行省略)\n` : ''}${kept.join('\n') || '(无记录)'}` }
+      const body = `${lines.length > kept.length ? `…(更早 ${lines.length - kept.length} 行省略，可用 sinceSeq 往前取)\n` : ''}${kept.join('\n') || '(无记录)'}`
+      // 这条工具的原文会整段进监督会话上下文：不限长就等于让评审自己把上下文撑爆。
+      const shrunk = capMiddle(body, config.workerLogMaxChars, `日志摘录（要更早/更细的用 sinceSeq 分段取，或用 maxLines 少要一点）`)
+      return { text: `${shrunk}${shrunk.length < body.length ? `\n\n[插件已按 ${config.workerLogMaxChars} 字预算裁剪，原 ${body.length} 字]` : ''}` }
     },
   })
 
@@ -1899,8 +2914,13 @@ export function apply(ctx, rawConfig = {}) {
         handovers: pair.handovers,
         maxHandovers: config.maxHandovers,
         maxContextTokens: config.maxContextTokens,
-        workerTokens: contextTokens(pair.workerId) ?? pair.lastWorkerTokens ?? null,
-        supervisorTokens: contextTokens(pair.supervisorId) ?? pair.lastSupervisorTokens ?? null,
+        contextLimit: pressureOf(pair.workerId).limit,
+        contextWindow: pressureOf(pair.workerId).window ?? null,
+        contextCeiling: ceilingOf(pair.workerId) ?? ceilingOf(pair.supervisorId) ?? null,
+        contextSource: pressureOf(pair.workerId).source,
+        workerTokens: pressureOf(pair.workerId).tokens ?? pair.lastWorkerTokens ?? null,
+        supervisorTokens: pressureOf(pair.supervisorId).tokens ?? pair.lastSupervisorTokens ?? null,
+        overflowCount: pair.overflowCount ?? 0,
         lastVerdict: pair.lastVerdict,
         createdAt: pair.createdAt,
         lineage: pair.lineage,
@@ -1920,7 +2940,7 @@ export function apply(ctx, rawConfig = {}) {
       type: 'object',
       properties: {
         pairId: { type: 'string', description: 'Only events of one pair.' },
-        kind: { type: 'string', enum: ['pair', 'review', 'verdict', 'handover', 'halted', 'stopped', 'client-error', 'user-review', 'requirement', 'pairing'], description: 'Only events of one kind.' },
+        kind: { type: 'string', enum: ['pair', 'review', 'verdict', 'handover', 'halted', 'stopped', 'client-error', 'user-review', 'requirement', 'pairing', 'overflow', 'delivery-trim', 'pressure-wall'], description: 'Only events of one kind（overflow=上下文溢出记录、delivery-trim=投递裁剪、pressure-wall=水位撞墙）.' },
         text: { type: 'string', description: 'Substring match against the whole event JSON (summary, instructions, requirement…).' },
         limit: { type: 'number', description: 'Max events, default 300.' },
       },

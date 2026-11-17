@@ -42,6 +42,10 @@ window.__ModuleLoader__.load({
       'filter.client-error': '浏览器错误',
       'filter.user-review': '客户反馈',
       'filter.requirement': '验收标准',
+      'filter.overflow': '上下文溢出',
+      'filter.delivery-trim': '投递裁剪',
+      'filter.pressure-wall': '水位撞墙',
+      'context.line': '水位/阈值',
         'detail.title': '详情',
         'detail.empty': '点击左边的报告条目查看全文。',
         'worker': '执行',
@@ -105,6 +109,10 @@ window.__ModuleLoader__.load({
       'filter.client-error': 'UI errors',
       'filter.user-review': 'Feedback',
       'filter.requirement': 'Acceptance',
+      'filter.overflow': 'Context overflow',
+      'filter.delivery-trim': 'Delivery trim',
+      'filter.pressure-wall': 'Pressure wall',
+      'context.line': 'Pressure/limit',
         'detail.title': 'Detail',
         'detail.empty': 'Pick a report to read it.',
         'worker': 'Executor',
@@ -249,7 +257,7 @@ window.__ModuleLoader__.load({
       .sus-badge { display:inline-block; border-radius:999px; padding:3px 9px; font-size:11.5px; font-weight:600;
         letter-spacing:.01em; background:var(--ios-veil); color:var(--ios-t1); }
       .sus-badge[data-k="active"], .sus-badge[data-k="complete"] { background:rgba(52,199,89,.18); color:var(--ios-green); }
-      .sus-badge[data-k="halted"], .sus-badge[data-k="stopped"], .sus-badge[data-k="client-error"] { background:rgba(255,59,48,.16); color:var(--ios-red); }
+      .sus-badge[data-k="halted"], .sus-badge[data-k="stopped"], .sus-badge[data-k="client-error"], .sus-badge[data-k="overflow"], .sus-badge[data-k="pressure-wall"] { background:rgba(255,59,48,.16); color:var(--ios-red); }
       .sus-badge[data-k="reviewing"], .sus-badge[data-k="needs_fix"], .sus-badge[data-k="review"] { background:rgba(255,149,0,.20); color:var(--ios-orange); }
       .sus-badge[data-k="pair"], .sus-badge[data-k="handover"], .sus-badge[data-k="requirement"], .sus-badge[data-k="user-review"] { background:var(--ios-sel-bg); color:var(--ios-blue); }
 
@@ -284,7 +292,7 @@ window.__ModuleLoader__.load({
       .sus-ok { color:var(--ios-green); }
     `;
 
-    const KIND_LABEL = { pair: 'filter.pair', review: 'filter.review', verdict: '', handover: 'filter.handover', pairing: 'filter.pairing', halted: 'filter.halted', stopped: 'filter.halted' };
+    const KIND_LABEL = { pair: 'filter.pair', review: 'filter.review', verdict: '', handover: 'filter.handover', pairing: 'filter.pairing', halted: 'filter.halted', stopped: 'filter.halted', overflow: 'filter.overflow', 'delivery-trim': 'filter.delivery-trim', 'pressure-wall': 'filter.pressure-wall' };
 
     function fmtTime(ts) { try { return new Date(ts).toLocaleString(); } catch { return String(ts); } }
     function fmtShort(ts) { try { return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); } catch { return ''; } }
@@ -301,6 +309,9 @@ window.__ModuleLoader__.load({
       if (ev.kind === 'user-review') return `客户: ${d.text || ''}`;
       if (ev.kind === 'requirement') return `验收: ${(d.acceptance || []).join(' / ') || d.note || ''}`;
       if (ev.kind === 'pairing') { const d2 = ev.data || {}; return `${d2.action || ''}${d2.dropped ? ' → ' + (Array.isArray(d2.dropped) ? d2.dropped.join('/') : d2.dropped) : ''}${d2.kept ? '（保留 ' + d2.kept + '）' : ''}${d2.count ? '（复原 ' + d2.count + ' 对' + (d2.dormant ? '，休眠 ' + d2.dormant : '') + '）' : ''}`; }
+      if (ev.kind === 'overflow') { const p = d.pressure || {}; return `${ev.pairName || ev.pairId} · ${d.role === 'worker' ? t('worker') : t('supervisor')} · ${kfmt(d.role === 'worker' ? p.workerTokens : p.supervisorTokens)} · ${d.detail || ''}`; }
+      if (ev.kind === 'delivery-trim') return `${ev.pairName || ev.pairId} · ${d.tag}: ${d.from}→${d.to} 字 · ${kfmt(d.tokens)}/${kfmt(d.limit)}`;
+      if (ev.kind === 'pressure-wall') return `${ev.pairName || ev.pairId} · ${d.tag} ${kfmt(d.tokens)}/${kfmt(d.limit)} · ${d.rolled ? t('filter.handover') : d.role}`;
     if (ev.kind === 'stopped') return `${ev.pairId} stopped`;
       return ev.kind;
     }
@@ -431,7 +442,7 @@ window.__ModuleLoader__.load({
           ),
         ),
         h('div', { className: 'sus-bar' },
-          chip('all'), chip('pair'), chip('review'), chip('needs_fix'), chip('complete'), chip('halted'), chip('handover'), chip('client-error'), chip('user-review'), chip('requirement'),
+          chip('all'), chip('pair'), chip('review'), chip('needs_fix'), chip('complete'), chip('halted'), chip('handover'), chip('overflow'), chip('client-error'), chip('user-review'), chip('requirement'),
           h('input', {
             className: 'sus-input', type: 'search', 'aria-label': t('search'), placeholder: t('search'), value: text,
             onChange: (e) => setText(e.target.value),
@@ -468,6 +479,7 @@ window.__ModuleLoader__.load({
             h('div', { className: 'sus-kv' }, h('span', null, t('state')), h('span', { className: `sus-badge`, 'data-k': p.state }, p.state)),
             h('div', { className: 'sus-kv' }, h('span', null, t('phase')), h('span', null, `${p.phase || ''}${p.reportPending === 'fix' ? ` · ${t('pending-report')}` : p.reportPending === 'done' ? ` · ${t('pending-done')}` : ''}`)),
             h('div', { className: 'sus-kv' }, h('span', null, t('worker')), h('span', null, p.workerRunning ? t('running') : t('idle'), ' ', kfmt(p.workerTokens))),
+            h('div', { className: 'sus-kv' }, h('span', null, t('context.line')), h('span', { className: (p.overflowCount || p.contextSource === 'heuristic') ? 'sus-err' : '' }, `${kfmt(p.workerTokens)} / ${kfmt(p.contextLimit)}${p.contextWindow ? ` · ${t('context')} ${kfmt(p.contextWindow)}` : ''}${p.contextSource ? ` · ${p.contextSource}` : ''}${p.overflowCount ? ` · ${t('filter.overflow')} ${p.overflowCount}` : ''}`)),
             h('div', { className: 'sus-kv' }, h('span', null, t('supervisor')), h('span', null, p.supervisorRunning ? t('running') : t('idle'), ' ', kfmt(p.supervisorTokens))),
             h('div', { className: 'sus-kv' }, h('span', null, t('rounds')), h('span', null, `${p.reviews}/${p.maxReviews} · ${t('fixes')} ${p.fixRounds}/${p.maxFixRounds} · ${t('handovers')} ${p.handovers}/${p.maxHandovers}`)),
             h('div', { className: 'sus-kv' }, h('span', null, t('pairing')), h('span', { className: (p.pairing && p.pairing.oneToOne === false) ? 'sus-err' : 'sus-ok' }, (p.pairing && p.pairing.oneToOne === false) ? `${t('pairing.conflict')}：${(p.pairing.conflicts || []).map((c) => c.kind).join('/')}` : t('pairing.ok'), (p.retiredSessions || []).length ? ` · ${t('retired')} ${p.retiredSessions.length}` : '')),

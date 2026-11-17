@@ -5,3 +5,13 @@
       config:
         maxFixRounds: 8
         maxReviews: 24
+        # v1.3.0 客户口径「上下文不能大于 500KB」：512000 = 500×1024，比原来的 512K(524288) 更保守。
+        # 实际阈值 = min(设定值, 真实窗口 − contextReserveTokens(60k))（并有下限兜底）：
+        #   本机窗口 1048576 → 阈值 512000（等于设定值，未触夹）；
+        #   若某路由窗口只有 524288 → min(512000, 464288) = 464288（被夹住）；
+        #   客户要 1M(1048576) + 本机窗口 1M → min(1048576, 988576) = 988576。
+        contextSplitTokens: 512000
+        # v1.3.0 文本工具调用守卫：模型把 tool-call 写成正文（<tool_call>/<function=…>）时
+        # 注入纠正（点名真实 shell 工具 pwsh），连续最多 4 次，干净一轮即清零。
+        textToolCallGuard: true
+        textToolCallGuardMax: 4
