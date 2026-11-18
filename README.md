@@ -344,6 +344,8 @@ needs_fix 还必须给 `fixInstructions`；整改指令带监督逐项核验记�
 `maxFixRounds`(3) / `maxReviews`(12) / `strictPairing`(true) / `hydratePairs`(true) / `stopRetiredSession`(true) / `dormantAfterMs`(6h) / `reuseCardCooldownMs`(60000) / `retiredNoticeMs`(300000) / `rolloverCooldownMs`(60000) / `maxHandovers`(8) / `maxContextTokens`(240000) / `contextReserveTokens`(60000) / `minContextTokens`(12000) / `contextSafetyRatio`(0.5) / `deliverMaxChars`(12000) / `reviewMaxChars`(20000) / `handoverMaxChars`(9000) / `requirementMaxChars`(4000) / `checklistNoteMaxChars`(2200) / `fixSummaryMaxChars`(1500) / `fixInstrMaxChars`(3000) / `workerLogMaxChars`(9000) / `handoverTailLines`(25) / `overflowRelay`(true) / `digestMaxChars`(6000) / `serialWaitMs`(1800000) / `reviewTurnTimeoutMs`(1800000) / `maxReviewTimeouts`(2) / `workerTurnTimeoutMs`(2700000) / `maxWorkerTimeouts`(2) / `deferAfterMs`(120000) / `reviewEnabled`(true) / `autoEnrollReview`(true) / `reviewTriggerPattern`('需要审查') / `idleNudgeMs`(120000) / `idleForceReviewMs`(300000) / `completeSummaryMinChars`(40) / `debugEnrollTrace`(false)
 
 > 改 profile `cordis.patch.yml`（加/删 config 覆盖段）触发的重转会**清空内存里的监督对**（journal 与会话不丢）；重转后在存活执行会话里 `supervision_enroll` 重建即可。加 `# touch` 注释行只为了触发重编译加载新代码。
+>
+> **1.3.1 本机覆盖**：`workerTurnTimeoutMs: 3600000`（**60 分钟**，代码默认 2700000=45 分钟）。原因见 `验证报告-20261118-500K口径与文本调用守卫.md` §6：320k 上下文的本地模型单轮曾连续超 45 分钟被看门狗中止 2 次→熔断（`sup-1-045t0`）。生效值已透出到 `supervision_status.running.turnTimeoutMs`，可直接核对。
 
 ## 已知边界
 

@@ -2410,6 +2410,8 @@ export function apply(ctx, rawConfig = {}) {
       deferredDelivery: (pair.pendingDeliveries ?? []).map((row) => row.tag).join('/') || null,
       queuedDeliveries: (pair.pendingDeliveries ?? []).length,
       watchdogSeconds: watchdogAt ? Math.round((Date.now() - watchdogAt) / 1000) : null,
+      // v1.3.1 单轮上限透出到状态：本地模型上下文大时一轮可能很久，客户要能看到实际生效值
+      turnTimeoutMs: config.workerTurnTimeoutMs,
       // 本地模型单通道：这里能直接看到「现在有几路在抢通道」，>0 时插件不会插队
       channel: { others: channelOthers(pair).length, samples: channelOthers(pair).slice(0, 4), deferredByChannel: pair.deferredByChannel ?? 0, source: channelSource, guard: config.channelGuard },
     },
